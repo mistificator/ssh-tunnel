@@ -1,4 +1,5 @@
 import configparser
+import json
 import os
 import shutil
 import socket
@@ -9,6 +10,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from urllib.parse import urlparse
 
 # Platform checks
 IS_WINDOWS = sys.platform.startswith("win")
@@ -32,6 +34,155 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
 REG_INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 INTERNET_OPTION_SETTINGS_CHANGED = 39
 INTERNET_OPTION_REFRESH = 37
+
+
+# ----------------- Askpass Helper Mode (Subprocess Entry) -----------------
+def run_askpass_client():
+    """
+    Executed by OpenSSH via SSH_ASKPASS.
+    Forwards the SSH prompt (host key verification or password prompt)
+    to the GUI's local AskpassServer and prints the response to stdout.
+    """
+    if len(sys.argv) < 3:
+        sys.exit(1)
+    try:
+        port = int(sys.argv[2])
+        prompt_text = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else ""
+        with socket.create_connection(("127.0.0.1", port), timeout=120.0) as s:
+            payload = json.dumps({"prompt": prompt_text}).encode("utf-8")
+            s.sendall(struct.pack("!I", len(payload)) + payload)
+            hdr = s.recv(4)
+            if len(hdr) < 4:
+                sys.exit(1)
+            resp_len = struct.unpack("!I", hdr)[0]
+            data = bytearray()
+            while len(data) < resp_len:
+                chunk = s.recv(resp_len - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            resp = json.loads(data.decode("utf-8", errors="ignore"))
+            if not resp.get("ok", True):
+                sys.exit(1)
+            sys.stdout.write(resp.get("answer", "") + "\n")
+            sys.stdout.flush()
+    except Exception:
+        sys.exit(1)
+
+
+# ----------------- DNS & Host Helpers -----------------
+def sanitize_host(raw_host: str) -> str:
+    """Cleans up user input in the SSH Host field."""
+    h = raw_host.strip()
+    if "://" in h:
+        parsed = urlparse(h)
+        h = parsed.hostname or h
+    if "@" in h:
+        h = h.split("@")[-1]
+    if "/" in h:
+        h = h.split("/")[0]
+    # Strip port if accidentally included in IPv4/domain host field
+    if h.count(":") == 1:
+         h = h.split(":")[0]
+    return h.strip()
+
+
+def is_ipv4_address(host: str) -> bool:
+    try:
+        socket.inet_aton(host)
+        return True
+    except OSError:
+        return False
+
+
+def build_dns_query(domain: str, tx_id: bytes = b"\x42\x42") -> bytes:
+    """Builds a standard DNS A-record query packet."""
+    qname = bytearray()
+    for part in domain.strip(".").split("."):
+        encoded = part.encode("idna")
+        qname.append(len(encoded))
+        qname.extend(encoded)
+    qname.append(0)
+    return tx_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + bytes(qname) + b"\x00\x01\x00\x01"
+
+
+def parse_dns_a_response(data: bytes, tx_id: bytes = b"\x42\x42") -> str | None:
+    """Extracts the first IPv4 A-record from a raw DNS response packet."""
+    if len(data) < 12 or data[:2] != tx_id:
+        return None
+    qdcount = struct.unpack("!H", data[4:6])[0]
+    ancount = struct.unpack("!H", data[6:8])[0]
+    if ancount == 0:
+        return None
+
+    offset = 12
+    for _ in range(qdcount):
+        while offset < len(data):
+            length = data[offset]
+            offset += 1
+            if length == 0:
+                break
+            elif (length & 0xC0) == 0xC0:
+                offset += 1
+                break
+            else:
+                offset += length
+        offset += 4
+
+    for _ in range(ancount):
+        if offset >= len(data):
+            break
+        if (data[offset] & 0xC0) == 0xC0:
+            offset += 2
+        else:
+            while offset < len(data):
+                length = data[offset]
+                offset += 1
+                if length == 0:
+                    break
+                offset += length
+        if offset + 10 > len(data):
+            break
+        rtype, rclass, _, rdlength = struct.unpack("!HHIH", data[offset:offset + 10])
+        offset += 10
+        if rtype == 1 and rclass == 1 and rdlength == 4 and offset + 4 <= len(data):
+            return socket.inet_ntoa(data[offset:offset + 4])
+        offset += rdlength
+    return None
+
+
+def resolve_host_ipv4(host: str) -> tuple[str | None, bool]:
+    """
+    Resolves hostname to IPv4.
+    Returns (ip, used_fallback_dns).
+    First tries system DNS; if that fails, queries 1.1.1.1 / 8.8.8.8 directly.
+    """
+    if is_ipv4_address(host):
+        return host, False
+
+    try:
+        ip = socket.gethostbyname(host)
+        if ip:
+            return ip, False
+    except OSError:
+        pass
+
+    # Fallback direct UDP DNS query to public resolvers
+    tx_id = os.urandom(2)
+    query = build_dns_query(host, tx_id)
+    for dns_srv in ("1.1.1.1", "8.8.8.8"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(2.5)
+                s.sendto(query, (dns_srv, 53))
+                resp, _ = s.recvfrom(2048)
+                ip = parse_dns_a_response(resp, tx_id)
+                if ip:
+                    return ip, True
+        except Exception:
+            continue
+
+    return None, False
 
 
 # ----------------- Windows Proxy Helpers -----------------
@@ -86,8 +237,19 @@ def read_windows_proxy_settings():
     return socks_port, bypass_list
 
 
-def set_windows_proxy(enabled: bool, socks_port: str = "1080", bypass_list: str = ""):
-    """Configures system proxy in Windows Registry."""
+def set_windows_proxy(
+    enabled: bool,
+    socks_port: str = "1080",
+    bypass_list: str = "",
+    remote_dns: bool = True,
+    extra_bypass: list[str] | None = None
+):
+    """
+    Configures system proxy in Windows Registry.
+    When remote_dns=True, sets AutoConfigURL to our local PAC endpoint so
+    browsers (Chrome, Edge, Brave, Opera, Firefox) use SOCKS5 with remote DNS
+    resolution instead of WinINet's legacy SOCKS4 local DNS resolution.
+    """
     if not IS_WINDOWS or winreg is None:
         return
 
@@ -96,14 +258,31 @@ def set_windows_proxy(enabled: bool, socks_port: str = "1080", bypass_list: str 
             if enabled:
                 proxy_server_val = f"socks=127.0.0.1:{socks_port}"
                 items = [x.strip() for x in bypass_list.replace("\n", ";").split(";") if x.strip() and x.lower() != "<local>"]
+                if extra_bypass:
+                    for eb in extra_bypass:
+                        if eb and eb not in items:
+                            items.append(eb)
                 items.append("<local>")
                 reg_bypass_val = ";".join(items)
 
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
                 winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, proxy_server_val)
                 winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, reg_bypass_val)
+
+                if remote_dns:
+                    pac_url = f"http://127.0.0.1:{socks_port}/proxy.pac?t={int(time.time())}"
+                    winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, pac_url)
+                else:
+                    try:
+                        winreg.DeleteValue(key, "AutoConfigURL")
+                    except FileNotFoundError:
+                        pass
             else:
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+                try:
+                    winreg.DeleteValue(key, "AutoConfigURL")
+                except FileNotFoundError:
+                    pass
         notify_windows_proxy_change()
     except Exception as e:
         print(f"Error updating Windows registry proxy: {e}")
@@ -145,23 +324,37 @@ def read_linux_proxy_settings():
     return socks_port, bypass_list
 
 
-def set_linux_proxy(enabled: bool, socks_port: str = "1080", bypass_list: str = ""):
+def set_linux_proxy(
+    enabled: bool,
+    socks_port: str = "1080",
+    bypass_list: str = "",
+    remote_dns: bool = True,
+    extra_bypass: list[str] | None = None
+):
     """Sets desktop proxy settings using gsettings."""
     if not shutil.which("gsettings"):
         return
 
     try:
         if enabled:
-            subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"], check=False)
             subprocess.run(["gsettings", "set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"], check=False)
             subprocess.run(["gsettings", "set", "org.gnome.system.proxy.socks", "port", str(socks_port)], check=False)
 
             items = [x.strip() for x in bypass_list.replace("\n", ";").replace(",", ";").split(";") if x.strip()]
+            if extra_bypass:
+                for eb in extra_bypass:
+                    if eb and eb not in items:
+                        items.append(eb)
             for default_host in ["localhost", "127.0.0.0/8", "::1"]:
                 if default_host not in items:
                     items.append(default_host)
             formatted_items = "[" + ", ".join(f"'{item}'" for item in items) + "]"
             subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "ignore-hosts", formatted_items], check=False)
+
+            if remote_dns:
+                pac_url = f"http://127.0.0.1:{socks_port}/proxy.pac"
+                subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "autoconfig-url", pac_url], check=False)
+            subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"], check=False)
         else:
             subprocess.run(["gsettings", "set", "org.gnome.system.proxy", "mode", "none"], check=False)
     except Exception as e:
@@ -177,15 +370,21 @@ def read_system_proxy_settings():
     return "1080", ""
 
 
-def set_system_proxy(enabled: bool, socks_port: str = "1080", bypass_list: str = ""):
+def set_system_proxy(
+    enabled: bool,
+    socks_port: str = "1080",
+    bypass_list: str = "",
+    remote_dns: bool = True,
+    extra_bypass: list[str] | None = None
+):
     if IS_WINDOWS:
-        set_windows_proxy(enabled, socks_port, bypass_list)
+        set_windows_proxy(enabled, socks_port, bypass_list, remote_dns, extra_bypass)
     elif IS_LINUX:
-        set_linux_proxy(enabled, socks_port, bypass_list)
+        set_linux_proxy(enabled, socks_port, bypass_list, remote_dns, extra_bypass)
 
 
 def get_free_port(preferred_port: int = 1081) -> int:
-    """Finds an available TCP port for the internal OpenSSH SOCKS listener."""
+    """Finds an available TCP port for internal listeners."""
     for port in range(preferred_port, preferred_port + 500):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -195,6 +394,89 @@ def get_free_port(preferred_port: int = 1081) -> int:
             except OSError:
                 continue
     return 10888
+
+
+# ----------------- Interactive SSH Askpass Server -----------------
+class AskpassServer:
+    """
+    Local TCP server that intercepts OpenSSH prompts from SSH_ASKPASS.
+    Handles interactive (yes/no) host key verification via GUI dialog
+    and automatic password submission.
+    """
+    def __init__(self, password_getter, host_confirm_cb, log_cb):
+        self.password_getter = password_getter
+        self.host_confirm_cb = host_confirm_cb
+        self.log_cb = log_cb
+        self.running = True
+        self.waiting_user_confirm = False
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        self.sock.listen(5)
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while self.running:
+            try:
+                conn, _ = self.sock.accept()
+                threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+            except Exception:
+                break
+
+    def _handle_client(self, conn: socket.socket):
+        try:
+            hdr = conn.recv(4)
+            if len(hdr) < 4:
+                conn.close()
+                return
+            msg_len = struct.unpack("!I", hdr)[0]
+            data = bytearray()
+            while len(data) < msg_len:
+                chunk = conn.recv(msg_len - len(data))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            req = json.loads(data.decode("utf-8", errors="ignore"))
+            prompt = req.get("prompt", "").strip()
+            prompt_lower = prompt.lower()
+
+            # Check if OpenSSH is asking for host key verification (yes/no)
+            if (
+                "yes/no" in prompt_lower
+                or "authenticity of host" in prompt_lower
+                or "continue connecting" in prompt_lower
+                or "fingerprint" in prompt_lower
+            ):
+                self.waiting_user_confirm = True
+                try:
+                    approved = self.host_confirm_cb(prompt)
+                finally:
+                    self.waiting_user_confirm = False
+
+                answer = "yes" if approved else "no"
+                resp_bytes = json.dumps({"ok": True, "answer": answer}).encode("utf-8")
+            else:
+                # Password or passphrase prompt
+                pwd = self.password_getter()
+                resp_bytes = json.dumps({"ok": True, "answer": pwd}).encode("utf-8")
+
+            conn.sendall(struct.pack("!I", len(resp_bytes)) + resp_bytes)
+        except Exception as e:
+            self.log_cb(f"> Askpass IPC error: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def close(self):
+        self.running = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 
 # ----------------- badvpn-udpgw Client Bridge -----------------
@@ -312,17 +594,33 @@ class BadVpnClient:
         self._close_sock()
 
 
-# ----------------- SOCKS & UDP Bridge -----------------
+# ----------------- SOCKS, PAC & UDP Bridge -----------------
 class SocksUdpBridge:
     """
-    SOCKS Bridge:
-    - Forwards SOCKS4/SOCKS5 TCP CONNECT to internal SSH listener.
+    Local SOCKS5/SOCKS4 & PAC Bridge:
+    - Serves /proxy.pac on HTTP GET so browsers use SOCKS5 with Remote DNS.
+    - Forwards SOCKS4/SOCKS5 TCP CONNECT to internal OpenSSH listener.
+    - Resolves UDP ATYP=3 domains through SSH TCP tunnel when remote_dns is enabled.
     - Handles SOCKS5 UDP ASSOCIATE and routes datagrams to badvpn-udpgw.
     """
-    def __init__(self, socks_port: int, internal_ssh_port: int, udpgw_port: int, log_cb):
+    def __init__(
+        self,
+        socks_port: int,
+        internal_ssh_port: int,
+        udpgw_port: int,
+        enable_udp: bool,
+        remote_dns: bool,
+        bypass_list: str,
+        extra_bypass: list[str],
+        log_cb
+    ):
         self.socks_port = socks_port
         self.internal_ssh_port = internal_ssh_port
         self.udpgw_port = udpgw_port
+        self.enable_udp = enable_udp
+        self.remote_dns = remote_dns
+        self.bypass_list = bypass_list
+        self.extra_bypass = extra_bypass or []
         self.log_cb = log_cb
         self.running = True
         self.dns_cache = {}
@@ -332,15 +630,110 @@ class SocksUdpBridge:
         self.tcp_server.bind(('127.0.0.1', socks_port))
         self.tcp_server.listen(128)
 
-        self.udp_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_server.bind(('127.0.0.1', socks_port))
-
-        self.badvpn_client = BadVpnClient(udpgw_port, self.udp_server, log_cb)
+        self.udp_server = None
+        self.badvpn_client = None
+        if self.enable_udp:
+            self.udp_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_server.bind(('127.0.0.1', socks_port))
+            self.badvpn_client = BadVpnClient(udpgw_port, self.udp_server, log_cb)
 
     def start(self):
         threading.Thread(target=self._tcp_accept_loop, daemon=True).start()
-        threading.Thread(target=self._udp_relay_loop, daemon=True).start()
-        self.log_cb(f"> SOCKS bridge (TCP/UDP :{self.socks_port} -> SSH :{self.internal_ssh_port}) started.")
+        if self.enable_udp and self.udp_server:
+            threading.Thread(target=self._udp_relay_loop, daemon=True).start()
+        mode_str = "TCP/UDP" if self.enable_udp else "TCP"
+        dns_str = "Remote DNS" if self.remote_dns else "Local DNS"
+        self.log_cb(
+            f"> SOCKS5 bridge ({mode_str} :{self.socks_port} -> SSH :{self.internal_ssh_port}, {dns_str}) started."
+        )
+
+    def _generate_pac_script(self) -> bytes:
+        raw_items = [
+            x.strip() for x in self.bypass_list.replace("\n", ";").replace(",", ";").split(";")
+            if x.strip() and x.lower() != "<local>"
+        ]
+        for eb in self.extra_bypass:
+            if eb and eb not in raw_items:
+                raw_items.append(eb)
+
+        conditions = [
+            'isPlainHostName(host)',
+            'host === "localhost"',
+            'shExpMatch(host, "127.*")',
+            'shExpMatch(host, "::1")'
+        ]
+        for item in raw_items:
+            safe_item = item.replace('"', '').replace("'", "")
+            if safe_item:
+                conditions.append(f'shExpMatch(host, "{safe_item}")')
+
+        cond_expr = " ||\n        ".join(conditions)
+        pac_body = (
+            "function FindProxyForURL(url, host) {\n"
+            f"    if (\n        {cond_expr}\n    ) {{\n"
+            '        return "DIRECT";\n'
+            "    }\n"
+            f'    return "SOCKS5 127.0.0.1:{self.socks_port}; SOCKS 127.0.0.1:{self.socks_port}";\n'
+            "}\n"
+        ).encode("utf-8")
+
+        headers = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/x-ns-proxy-autoconfig\r\n"
+            f"Content-Length: {len(pac_body)}\r\n"
+            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("utf-8")
+        return headers + pac_body
+
+    def _resolve_via_ssh_tcp(self, domain: str) -> bytes | None:
+        """Resolves a domain name inside the SSH SOCKS5 tunnel using DNS-over-TCP (1.1.1.1:53)."""
+        if is_ipv4_address(domain):
+            return socket.inet_aton(domain)
+
+        ssh_sock = self._connect_to_ssh(timeout=3.0)
+        if not ssh_sock:
+            return None
+
+        try:
+            ssh_sock.settimeout(4.0)
+            ssh_sock.sendall(b"\x05\x01\x00")
+            if ssh_sock.recv(2) != b"\x05\x00":
+                return None
+
+            # Connect to 1.1.1.1:53 through SSH tunnel
+            req = b"\x05\x01\x00\x01" + socket.inet_aton("1.1.1.1") + struct.pack("!H", 53)
+            ssh_sock.sendall(req)
+            resp = ssh_sock.recv(10)
+            if len(resp) < 4 or resp[1] != 0:
+                return None
+
+            tx_id = os.urandom(2)
+            dns_pkt = build_dns_query(domain, tx_id)
+            ssh_sock.sendall(struct.pack("!H", len(dns_pkt)) + dns_pkt)
+
+            len_hdr = ssh_sock.recv(2)
+            if len(len_hdr) < 2:
+                return None
+            rlen = struct.unpack("!H", len_hdr)[0]
+            rdata = bytearray()
+            while len(rdata) < rlen:
+                chunk = ssh_sock.recv(rlen - len(rdata))
+                if not chunk:
+                    break
+                rdata.extend(chunk)
+
+            ip_str = parse_dns_a_response(bytes(rdata), tx_id)
+            if ip_str:
+                return socket.inet_aton(ip_str)
+        except Exception:
+            pass
+        finally:
+            try:
+                ssh_sock.close()
+            except Exception:
+                pass
+        return None
 
     def _connect_to_ssh(self, timeout=5.0):
         start = time.time()
@@ -408,6 +801,12 @@ class SocksUdpBridge:
                 client_sock.close()
                 return
 
+            # Serve PAC file if browser requests HTTP GET/HEAD on this port
+            if data.startswith((b"GET ", b"HEAD ")):
+                client_sock.sendall(self._generate_pac_script())
+                client_sock.close()
+                return
+
             ssh_sock = self._connect_to_ssh()
             if not ssh_sock:
                 client_sock.close()
@@ -437,7 +836,7 @@ class SocksUdpBridge:
                     return
 
                 cmd = req[1]
-                if cmd == 3:  # UDP ASSOCIATE
+                if cmd == 3 and self.enable_udp:  # UDP ASSOCIATE
                     ssh_sock.close()
                     ssh_sock = None
                     bnd_resp = b"\x05\x00\x00\x01\x7f\x00\x00\x01" + struct.pack("!H", self.socks_port)
@@ -479,23 +878,29 @@ class SocksUdpBridge:
                 atyp = data[3]
                 offset = 4
                 if atyp == 1:  # IPv4
-                    dest_ip_bytes = data[offset:offset+4]
+                    dest_ip_bytes = data[offset:offset + 4]
                     offset += 4
                 elif atyp == 3:  # FQDN
                     d_len = data[offset]
                     offset += 1
-                    domain = data[offset:offset+d_len].decode('utf-8', errors='ignore')
+                    domain = data[offset:offset + d_len].decode('utf-8', errors='ignore')
                     offset += d_len
                     if domain not in self.dns_cache:
-                        self.dns_cache[domain] = socket.inet_aton(socket.gethostbyname(domain))
+                        resolved = None
+                        if self.remote_dns:
+                            resolved = self._resolve_via_ssh_tcp(domain)
+                        if not resolved:
+                            resolved = socket.inet_aton(socket.gethostbyname(domain))
+                        self.dns_cache[domain] = resolved
                     dest_ip_bytes = self.dns_cache[domain]
                 else:
                     continue
 
-                dest_port = struct.unpack("!H", data[offset:offset+2])[0]
-                payload = data[offset+2:]
+                dest_port = struct.unpack("!H", data[offset:offset + 2])[0]
+                payload = data[offset + 2:]
 
-                self.badvpn_client.send_packet(addr, dest_ip_bytes, dest_port, payload)
+                if self.badvpn_client:
+                    self.badvpn_client.send_packet(addr, dest_ip_bytes, dest_port, payload)
             except Exception:
                 if not self.running:
                     break
@@ -506,28 +911,31 @@ class SocksUdpBridge:
             self.tcp_server.close()
         except Exception:
             pass
-        try:
-            self.udp_server.close()
-        except Exception:
-            pass
-        self.badvpn_client.close()
+        if self.udp_server:
+            try:
+                self.udp_server.close()
+            except Exception:
+                pass
+        if self.badvpn_client:
+            self.badvpn_client.close()
 
 
 # ----------------- GUI Application -----------------
 class SOCKSProxyApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        # Renamed title
         self.title("SOCKS5 Tunnel")
-        self.geometry("500x760")
+        self.geometry("560x800")
         self.resizable(False, False)
         self.configure(bg="#1E1E24")
 
         self.is_connected = False
         self.ssh_process = None
         self.bridge = None
+        self.askpass_server = None
         self._is_loading_config = False
         self._is_testing = False
+        self._current_extra_bypass = []
 
         self._build_ui()
         self.load_config(CONFIG_FILE)
@@ -562,7 +970,9 @@ class SOCKSProxyApp(tk.Tk):
         self.canvas.tag_bind(self.btn_text, "<Button-1>", lambda e: self.toggle_connection())
 
         # Connection status label
-        self.status_lbl = tk.Label(btn_frame, text="Disconnected", fg="#8C93A4", bg="#1E1E24", font=("Segoe UI", 11, "bold"))
+        self.status_lbl = tk.Label(
+            btn_frame, text="Disconnected", fg="#8C93A4", bg="#1E1E24", font=("Segoe UI", 11, "bold")
+        )
         self.status_lbl.pack(pady=(2, 0))
 
         # Ping status label
@@ -575,21 +985,23 @@ class SOCKSProxyApp(tk.Tk):
             font=("Segoe UI", 9, "bold"), padx=10, pady=5
         )
         settings_frame.pack(fill="x", padx=15, pady=2)
+        # Allow column 1 (SSH Host / Username / Password) to stretch horizontally for long domain names
+        settings_frame.grid_columnconfigure(1, weight=1)
 
         self._add_label(settings_frame, "SSH Host:", 0, 0)
-        self.host_entry = self._add_entry(settings_frame, "1.2.3.4", 0, 1)
+        self.host_entry = self._add_entry(settings_frame, "1.2.3.4", 0, 1, width=28)
 
         self._add_label(settings_frame, "SSH Port:", 0, 2)
         self.ssh_port_entry = self._add_entry(settings_frame, "22", 0, 3, width=7)
 
         self._add_label(settings_frame, "Username:", 1, 0)
-        self.user_entry = self._add_entry(settings_frame, "root", 1, 1)
+        self.user_entry = self._add_entry(settings_frame, "root", 1, 1, width=28)
 
         self._add_label(settings_frame, "SOCKS5 Port:", 1, 2)
         self.socks_port_entry = self._add_entry(settings_frame, "1080", 1, 3, width=7)
 
         self._add_label(settings_frame, "SSH Password:", 2, 0)
-        self.pass_entry = self._add_entry(settings_frame, "", 2, 1, show="*")
+        self.pass_entry = self._add_entry(settings_frame, "", 2, 1, width=28, show="*")
 
         self.compress_var = tk.BooleanVar(value=True)
         self.compress_chk = tk.Checkbutton(
@@ -604,7 +1016,7 @@ class SOCKSProxyApp(tk.Tk):
         self.udp_gw_var = tk.StringVar(value="disabled")
         self.udp_gw_combo = ttk.Combobox(
             settings_frame, textvariable=self.udp_gw_var,
-            values=["disabled", "badvpn-udpgw"], state="readonly", width=14
+            values=["disabled", "badvpn-udpgw"], state="readonly", width=16
         )
         self.udp_gw_combo.grid(row=3, column=1, sticky="w", padx=3, pady=2)
         self.udp_gw_combo.bind("<<ComboboxSelected>>", lambda e: self._on_setting_changed())
@@ -612,16 +1024,29 @@ class SOCKSProxyApp(tk.Tk):
         self._add_label(settings_frame, "UDP Port:", 3, 2)
         self.udpgw_port_entry = self._add_entry(settings_frame, "7300", 3, 3, width=7)
 
-        self._add_label(settings_frame, "Bypass List:", 4, 0)
+        # DNS routing option
+        self._add_label(settings_frame, "DNS Routing:", 4, 0)
+        self.remote_dns_var = tk.BooleanVar(value=True)
+        self.remote_dns_chk = tk.Checkbutton(
+            settings_frame,
+            text="Route browser DNS inside tunnel (Remote DNS via SOCKS5)",
+            variable=self.remote_dns_var,
+            bg="#1E1E24", fg="#FFFFFF", selectcolor="#2B2D33",
+            activebackground="#1E1E24", activeforeground="#FFFFFF",
+            command=self._on_setting_changed
+        )
+        self.remote_dns_chk.grid(row=4, column=1, columnspan=3, sticky="w", padx=1, pady=1)
+
+        self._add_label(settings_frame, "Bypass List:", 5, 0)
         self.bypass_text = tk.Text(
-            settings_frame, height=3, width=32, bg="#2A2C35", fg="#FFFFFF",
+            settings_frame, height=3, width=38, bg="#2A2C35", fg="#FFFFFF",
             insertbackground="white", relief="flat", font=("Consolas", 8), wrap="word"
         )
-        self.bypass_text.grid(row=4, column=1, columnspan=3, sticky="we", padx=3, pady=3)
+        self.bypass_text.grid(row=5, column=1, columnspan=3, sticky="we", padx=3, pady=3)
         self.bypass_text.bind("<KeyRelease>", lambda event: self._on_setting_changed())
 
         io_btn_frame = tk.Frame(settings_frame, bg="#1E1E24")
-        io_btn_frame.grid(row=5, column=0, columnspan=4, pady=(6, 2), sticky="e")
+        io_btn_frame.grid(row=6, column=0, columnspan=4, pady=(6, 2), sticky="e")
 
         self.test_btn = tk.Button(
             io_btn_frame, text="⚡ Test", command=self.run_test,
@@ -695,6 +1120,7 @@ class SOCKSProxyApp(tk.Tk):
         }
         config["PROXY"] = {
             "socks_port": self.socks_port_entry.get().strip(),
+            "remote_dns": str(self.remote_dns_var.get()),
             "bypass_list": formatted_bypass
         }
         config["UDP"] = {
@@ -734,6 +1160,7 @@ class SOCKSProxyApp(tk.Tk):
             self.compress_var.set(ssh_sec.getboolean("compression", fallback=True))
 
             self._set_entry_val(self.socks_port_entry, proxy_sec.get("socks_port", "1080"))
+            self.remote_dns_var.set(proxy_sec.getboolean("remote_dns", fallback=True))
             raw_bypass = proxy_sec.get("bypass_list", "")
             items = [line.strip() for line in raw_bypass.splitlines() if line.strip()]
             self._set_bypass_val(";".join(items))
@@ -777,6 +1204,34 @@ class SOCKSProxyApp(tk.Tk):
         self.log_area.see("end")
         self.log_area.config(state="disabled")
 
+    # ----------------- Interactive Host Key Confirmation -----------------
+    def _confirm_ssh_host_dialog(self, prompt_text: str) -> bool:
+        """
+        Displays a thread-safe modal confirmation dialog on the Tkinter main thread
+        when OpenSSH asks whether to trust a new host fingerprint.
+        """
+        self.after(0, self.log, f"> [SSH Host Key Confirmation]\n{prompt_text}")
+        event = threading.Event()
+        result_box = {"approved": False}
+
+        def ask_on_main_thread():
+            msg = (
+                f"Обнаружен новый или неизвестный SSH-хост:\n\n"
+                f"{prompt_text}\n\n"
+                f"Вы доверяете этому хосту и хотите продолжить подключение (yes/no)?"
+            )
+            ans = messagebox.askyesno("Подтверждение SSH-хоста", msg, parent=self)
+            result_box["approved"] = bool(ans)
+            if ans:
+                self.log("> Host key confirmed by user (yes).")
+            else:
+                self.log("> Host key rejected by user (no).")
+            event.set()
+
+        self.after(0, ask_on_main_thread)
+        event.wait()
+        return result_box["approved"]
+
     # ----------------- Connection Diagnostics (TCP & UDP) -----------------
     def run_test(self):
         if self._is_testing:
@@ -802,7 +1257,7 @@ class SOCKSProxyApp(tk.Tk):
         tcp_ms = 0.0
         tcp_status = ""
 
-        # 1. Test TCP connection via google.com:80
+        # 1. Test TCP connection + Remote DNS via google.com:80 (ATYP=0x03)
         try:
             t0 = time.perf_counter()
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_sock:
@@ -820,9 +1275,14 @@ class SOCKSProxyApp(tk.Tk):
 
                 conn_resp = tcp_sock.recv(1024)
                 if len(conn_resp) < 4 or conn_resp[1] != 0:
-                    raise Exception(f"SOCKS5 CONNECT failed (code: {conn_resp[1] if len(conn_resp)>1 else 'unknown'})")
+                    raise Exception(
+                        f"SOCKS5 CONNECT failed (code: {conn_resp[1] if len(conn_resp) > 1 else 'unknown'})"
+                    )
 
-                http_req = b"HEAD / HTTP/1.1\r\nHost: google.com\r\nUser-Agent: SOCKS-Tester\r\nConnection: close\r\n\r\n"
+                http_req = (
+                    b"HEAD / HTTP/1.1\r\nHost: google.com\r\n"
+                    b"User-Agent: SOCKS-Tester\r\nConnection: close\r\n\r\n"
+                )
                 tcp_sock.sendall(http_req)
 
                 http_resp = tcp_sock.recv(512)
@@ -831,9 +1291,9 @@ class SOCKSProxyApp(tk.Tk):
 
                 if http_resp:
                     first_line = http_resp.split(b"\r\n")[0].decode('utf-8', errors='ignore')
-                    self.log(f"> [TCP Test] SUCCESS: google.com:80 -> {first_line} ({tcp_ms:.1f} ms)")
+                    self.log(f"> [TCP + Remote DNS Test] SUCCESS: google.com:80 -> {first_line} ({tcp_ms:.1f} ms)")
                 else:
-                    self.log(f"> [TCP Test] SUCCESS: Connection established ({tcp_ms:.1f} ms)")
+                    self.log(f"> [TCP + Remote DNS Test] SUCCESS: Connection established ({tcp_ms:.1f} ms)")
         except Exception as e:
             tcp_status = "Error"
             self.log(f"> [TCP Test] ERROR: {e}")
@@ -857,7 +1317,7 @@ class SOCKSProxyApp(tk.Tk):
                 tcp_ctrl.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
                 reply = tcp_ctrl.recv(1024)
                 if len(reply) < 10 or reply[1] != 0:
-                    raise Exception(f"UDP ASSOCIATE rejected (code {reply[1] if len(reply)>1 else '?'})")
+                    raise Exception(f"UDP ASSOCIATE rejected (code {reply[1] if len(reply) > 1 else '?'})")
 
                 relay_port = struct.unpack("!H", reply[8:10])[0]
 
@@ -890,7 +1350,6 @@ class SOCKSProxyApp(tk.Tk):
 
         self.log("> ========================================")
 
-        # Build ping summary line
         parts = []
         if tcp_ok:
             parts.append(f"TCP: {tcp_ms:.0f} ms")
@@ -919,6 +1378,9 @@ class SOCKSProxyApp(tk.Tk):
             self.stop_tunnel()
 
     def _cleanup_askpass(self):
+        if self.askpass_server:
+            self.askpass_server.close()
+            self.askpass_server = None
         for fname in ("askpass_temp.bat", "askpass_temp.sh"):
             path = os.path.join(CONFIG_DIR, fname)
             if os.path.exists(path):
@@ -927,14 +1389,40 @@ class SOCKSProxyApp(tk.Tk):
                 except OSError:
                     pass
 
+    def _create_askpass_wrapper(self, askpass_port: int) -> str:
+        """Creates a cross-platform wrapper script for SSH_ASKPASS."""
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        script_path = os.path.abspath(sys.argv[0])
+
+        if getattr(sys, "frozen", False):
+            base_cmd = f'"{sys.executable}" --askpass-client {askpass_port}'
+        else:
+            base_cmd = f'"{sys.executable}" "{script_path}" --askpass-client {askpass_port}'
+
+        if IS_WINDOWS:
+            askpass_path = os.path.join(CONFIG_DIR, "askpass_temp.bat")
+            with open(askpass_path, "w", encoding="utf-8") as f:
+                f.write(f"@echo off\n{base_cmd} %*\n")
+        else:
+            askpass_path = os.path.join(CONFIG_DIR, "askpass_temp.sh")
+            with open(askpass_path, "w", encoding="utf-8") as f:
+                f.write(f"#!/bin/sh\nexec {base_cmd} \"$@\"\n")
+            os.chmod(askpass_path, 0o700)
+
+        return askpass_path
+
     def start_tunnel(self):
-        host = self.host_entry.get().strip()
+        raw_host = self.host_entry.get().strip()
+        host = sanitize_host(raw_host)
+        if host != raw_host:
+            self._set_entry_val(self.host_entry, host)
+
         user = self.user_entry.get().strip()
         ssh_port = self.ssh_port_entry.get().strip()
         socks_port = self.socks_port_entry.get().strip()
-        password = self.pass_entry.get()
         bypass = self._get_bypass_val()
         use_compression = self.compress_var.get()
+        remote_dns = self.remote_dns_var.get()
         udp_gw = self.udp_gw_var.get()
         udpgw_port = self.udpgw_port_entry.get().strip()
 
@@ -942,56 +1430,77 @@ class SOCKSProxyApp(tk.Tk):
             messagebox.showwarning("Warning", "Please provide SSH host and username!")
             return
 
-        ssh_cmd = ["ssh"]
-        target_check_port = int(socks_port)
+        # Ensure system proxy is off before resolving DNS / starting SSH
+        set_system_proxy(False)
 
-        if udp_gw == "badvpn-udpgw":
-            internal_ssh_port = get_free_port(int(socks_port) + 1)
-            target_check_port = internal_ssh_port
-            ssh_cmd.extend([
-                "-D", f"127.0.0.1:{internal_ssh_port}",
-                "-L", f"{udpgw_port}:127.0.0.1:{udpgw_port}"
-            ])
-            try:
-                self.bridge = SocksUdpBridge(
-                    socks_port=int(socks_port),
-                    internal_ssh_port=internal_ssh_port,
-                    udpgw_port=int(udpgw_port),
-                    log_cb=self.log
-                )
-                self.bridge.start()
-            except Exception as e:
-                self.log(f"> Local SOCKS5 bridge error: {e}")
-                return
+        # Pre-resolve domain name via DNS
+        resolved_ip, used_fallback = resolve_host_ipv4(host)
+        self._current_extra_bypass = [host]
+        if resolved_ip:
+            if resolved_ip not in self._current_extra_bypass:
+                self._current_extra_bypass.append(resolved_ip)
+            if not is_ipv4_address(host):
+                src = "fallback DNS 1.1.1.1/8.8.8.8" if used_fallback else "system DNS"
+                self.log(f"> DNS resolved '{host}' -> {resolved_ip} ({src})")
         else:
-            ssh_cmd.extend(["-D", f"127.0.0.1:{socks_port}"])
+            self.log(f"> Warning: Could not pre-resolve '{host}' via IPv4 DNS; passing hostname to OpenSSH.")
 
-        ssh_cmd.extend([
+        internal_ssh_port = get_free_port(int(socks_port) + 1)
+        enable_udp = (udp_gw == "badvpn-udpgw")
+
+        try:
+            self.bridge = SocksUdpBridge(
+                socks_port=int(socks_port),
+                internal_ssh_port=internal_ssh_port,
+                udpgw_port=int(udpgw_port) if udpgw_port.isdigit() else 7300,
+                enable_udp=enable_udp,
+                remote_dns=remote_dns,
+                bypass_list=bypass,
+                extra_bypass=self._current_extra_bypass,
+                log_cb=self.log
+            )
+            self.bridge.start()
+        except Exception as e:
+            self.log(f"> Local SOCKS5 bridge error: {e}")
+            return
+
+        # Start interactive Askpass IPC server for host key confirmation & password
+        self.askpass_server = AskpassServer(
+            password_getter=lambda: self.pass_entry.get(),
+            host_confirm_cb=self._confirm_ssh_host_dialog,
+            log_cb=self.log
+        )
+        askpass_path = self._create_askpass_wrapper(self.askpass_server.port)
+
+        ssh_cmd = [
+            "ssh",
+            "-4",  # Force IPv4 to avoid hanging on unreachable IPv6 AAAA records
+            "-D", f"127.0.0.1:{internal_ssh_port}",
             "-p", ssh_port,
             "-N",
             "-v",
-            "-o", "StrictHostKeyChecking=accept-new"
-        ])
+            "-o", "StrictHostKeyChecking=ask",
+            "-o", "ConnectTimeout=12",
+            "-o", "ServerAliveInterval=30"
+        ]
+
+        if enable_udp:
+            ssh_cmd.extend(["-L", f"{udpgw_port}:127.0.0.1:{udpgw_port}"])
+
         if use_compression:
             ssh_cmd.append("-C")
-        ssh_cmd.append(f"{user}@{host}")
+
+        # If we resolved a domain name, connect to its IPv4 while keeping HostKeyAlias=host
+        # so ~/.ssh/known_hosts and confirmation dialogs use the domain name.
+        if resolved_ip and resolved_ip != host:
+            ssh_cmd.extend(["-o", f"HostKeyAlias={host}", f"{user}@{resolved_ip}"])
+        else:
+            ssh_cmd.append(f"{user}@{host}")
 
         env = os.environ.copy()
-        if password:
-            os.makedirs(CONFIG_DIR, exist_ok=True)
-            if IS_WINDOWS:
-                askpass_path = os.path.join(CONFIG_DIR, "askpass_temp.bat")
-                with open(askpass_path, "w", encoding="utf-8") as f:
-                    f.write(f"@echo {password}\n")
-            else:
-                askpass_path = os.path.join(CONFIG_DIR, "askpass_temp.sh")
-                with open(askpass_path, "w", encoding="utf-8") as f:
-                    f.write(f"#!/bin/sh\necho '{password}'\n")
-                os.chmod(askpass_path, 0o700)
-
-            env["SSH_ASKPASS"] = askpass_path
-            env["SSH_ASKPASS_REQUIRE"] = "force"
-            env["DISPLAY"] = "dummy:0"
+        env["SSH_ASKPASS"] = askpass_path
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["DISPLAY"] = "dummy:0"
 
         self.log(f"> Starting SSH: {' '.join(ssh_cmd)}")
 
@@ -1016,11 +1525,12 @@ class SOCKSProxyApp(tk.Tk):
             if self.bridge:
                 self.bridge.stop()
                 self.bridge = None
+            self._cleanup_askpass()
             return
 
         threading.Thread(
             target=self._monitor_ssh,
-            args=(socks_port, bypass, target_check_port),
+            args=(socks_port, bypass, internal_ssh_port),
             daemon=True
         ).start()
 
@@ -1038,8 +1548,8 @@ class SOCKSProxyApp(tk.Tk):
         reader_thread.start()
 
         connected_ok = False
-        start_wait = time.time()
-        while time.time() - start_wait < 15.0:
+        elapsed = 0.0
+        while elapsed < 20.0:
             if self.ssh_process.poll() is not None:
                 break
             try:
@@ -1048,11 +1558,17 @@ class SOCKSProxyApp(tk.Tk):
                     break
             except OSError:
                 time.sleep(0.2)
+                # Pause timeout countdown while user is reading the host key confirmation dialog
+                if not (self.askpass_server and self.askpass_server.waiting_user_confirm):
+                    elapsed += 0.2
 
         if connected_ok:
             self.after(0, lambda: self._set_ui_state(True, socks_port, bypass))
         else:
-            self.log(f"> Warning: SSH port (:{check_port}) did not respond in time. Please check the log.")
+            self.after(
+                0, self.log,
+                f"> Warning: SSH port (:{check_port}) did not respond in time. Please check the log."
+            )
 
         self.ssh_process.wait()
 
@@ -1068,9 +1584,16 @@ class SOCKSProxyApp(tk.Tk):
             self.canvas.itemconfig(self.circle_btn, fill="#10B981", outline="#059669")
             self.canvas.itemconfig(self.btn_text, text="ON")
             self.status_lbl.config(text="Connected", fg="#10B981")
-            set_system_proxy(True, socks_port, bypass)
-            self.log("> System proxy enabled.")
-            # Run quick diagnostics 600 ms after connection start
+            remote_dns = self.remote_dns_var.get()
+            set_system_proxy(
+                True,
+                socks_port=socks_port,
+                bypass_list=bypass,
+                remote_dns=remote_dns,
+                extra_bypass=self._current_extra_bypass
+            )
+            dns_mode = "Remote DNS via PAC/SOCKS5" if remote_dns else "Local DNS"
+            self.log(f"> System proxy enabled ({dns_mode}).")
             self.after(600, self.run_test)
         else:
             self.canvas.itemconfig(self.circle_btn, fill="#4A4E58", outline="#2B2D33")
@@ -1097,5 +1620,10 @@ class SOCKSProxyApp(tk.Tk):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--askpass-client":
+        run_askpass_client()
+        sys.exit(0)
+
     app = SOCKSProxyApp()
     app.mainloop()
+    
