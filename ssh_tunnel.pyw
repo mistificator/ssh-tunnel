@@ -40,15 +40,15 @@ INTERNET_OPTION_REFRESH = 37
 def run_askpass_client():
     """
     Executed by OpenSSH via SSH_ASKPASS.
-    Forwards the SSH prompt (host key verification or password prompt)
-    to the GUI's local AskpassServer and prints the response to stdout.
+    Forwards the SSH prompt to the GUI's local AskpassServer
+    and prints the response to stdout.
     """
     if len(sys.argv) < 3:
         sys.exit(1)
     try:
         port = int(sys.argv[2])
         prompt_text = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else ""
-        with socket.create_connection(("127.0.0.1", port), timeout=120.0) as s:
+        with socket.create_connection(("127.0.0.1", port), timeout=30.0) as s:
             payload = json.dumps({"prompt": prompt_text}).encode("utf-8")
             s.sendall(struct.pack("!I", len(payload)) + payload)
             hdr = s.recv(4)
@@ -399,19 +399,17 @@ def get_free_port(preferred_port: int = 1081) -> int:
     return 10888
 
 
-# ----------------- Interactive SSH Askpass Server -----------------
+# ----------------- Silent SSH Askpass Server -----------------
 class AskpassServer:
     """
     Local TCP server that intercepts OpenSSH prompts from SSH_ASKPASS.
-    Handles interactive (yes/no) host key verification via GUI dialog
-    and automatic password submission.
+    Silently answers 'yes' to any host key / yes-no prompts and automatically
+    supplies the user's password for authentication prompts.
     """
-    def __init__(self, password_getter, host_confirm_cb, log_cb):
+    def __init__(self, password_getter, log_cb):
         self.password_getter = password_getter
-        self.host_confirm_cb = host_confirm_cb
         self.log_cb = log_cb
         self.running = True
-        self.waiting_user_confirm = False
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -451,14 +449,7 @@ class AskpassServer:
                 or "continue connecting" in prompt_lower
                 or "fingerprint" in prompt_lower
             ):
-                self.waiting_user_confirm = True
-                try:
-                    approved = self.host_confirm_cb(prompt)
-                finally:
-                    self.waiting_user_confirm = False
-
-                answer = "yes" if approved else "no"
-                resp_bytes = json.dumps({"ok": True, "answer": answer}).encode("utf-8")
+                resp_bytes = json.dumps({"ok": True, "answer": "yes"}).encode("utf-8")
             else:
                 pwd = self.password_getter()
                 resp_bytes = json.dumps({"ok": True, "answer": pwd}).encode("utf-8")
@@ -602,8 +593,6 @@ class SocksUdpBridge:
     - Serves /proxy.pac on HTTP GET so browsers use SOCKS5 with Remote DNS.
     - When remote_dns=True, resolves SOCKS5 ATYP=3 (domain) and SOCKS4a requests
       to IPv4 (A-records) inside the SSH tunnel and connects via ATYP=1 (IPv4).
-      This prevents DNS leaks while avoiding broken/geo-mismatched IPv6 on the remote VPS
-      (fixing Google Gemini Notebooks / *.clients6.google.com issues).
     - Handles SOCKS5 UDP ASSOCIATE and routes datagrams to badvpn-udpgw.
     """
     def __init__(
@@ -770,6 +759,7 @@ class SocksUdpBridge:
 
         now = time.time()
         wait_event = None
+        is_leader = False
 
         with self.dns_lock:
             cached = self.dns_cache.get(domain)
@@ -781,8 +771,8 @@ class SocksUdpBridge:
                 wait_event = threading.Event()
                 self.dns_inflight[domain] = wait_event
                 is_leader = True
-                
-        if not locals().get("is_leader", False):
+
+        if not is_leader:
             wait_event.wait(timeout=6.0)
             with self.dns_lock:
                 cached = self.dns_cache.get(domain)
@@ -797,7 +787,6 @@ class SocksUdpBridge:
         finally:
             with self.dns_lock:
                 if resolved_ip_bytes:
-                    # Cache resolved IPv4 for 10 minutes
                     self.dns_cache[domain] = (resolved_ip_bytes, time.time() + 600.0)
                 self.dns_inflight.pop(domain, None)
                 wait_event.set()
@@ -898,7 +887,6 @@ class SocksUdpBridge:
                 port_bytes = rest_hdr[1:3]
                 ip_bytes = rest_hdr[3:7]
 
-                # Read null-terminated USERID
                 userid = bytearray()
                 while True:
                     b_ch = self._recv_exact(client_sock, 1)
@@ -909,7 +897,6 @@ class SocksUdpBridge:
                     if b_ch == b"\x00":
                         break
 
-                # Check for SOCKS4a (0.0.0.x with x != 0)
                 if ip_bytes[:3] == b"\x00\x00\x00" and ip_bytes[3] != 0:
                     domain_buf = bytearray()
                     while True:
@@ -949,7 +936,6 @@ class SocksUdpBridge:
                     client_sock.close()
                     return
 
-                # Immediately complete SOCKS5 auth locally (No Auth = 0x00)
                 client_sock.sendall(b"\x05\x00")
 
                 req_hdr = self._recv_exact(client_sock, 4)
@@ -983,8 +969,6 @@ class SocksUdpBridge:
                     domain = domain_bytes.decode("utf-8", errors="ignore")
                     resolved_ipv4 = None
                     if self.remote_dns and cmd == 1:
-                        # Resolve domain to IPv4 inside the SSH tunnel so remote sshd
-                        # connects via IPv4 and never hits broken/geo-blocked IPv6 on Google/Gemini
                         resolved_ipv4 = self._resolve_via_ssh_tcp(domain)
 
                     if resolved_ipv4:
@@ -1003,7 +987,6 @@ class SocksUdpBridge:
                     client_sock.close()
                     return
 
-                # Handle UDP ASSOCIATE locally if UDP Gateway is enabled
                 if cmd == 3 and self.enable_udp:
                     bnd_resp = b"\x05\x00\x00\x01\x7f\x00\x00\x01" + struct.pack("!H", self.socks_port)
                     client_sock.sendall(bnd_resp)
@@ -1015,7 +998,6 @@ class SocksUdpBridge:
                     client_sock.close()
                     return
 
-                # Forward TCP CONNECT to internal OpenSSH SOCKS5 listener
                 ssh_sock = self._connect_to_ssh()
                 if not ssh_sock:
                     client_sock.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -1279,7 +1261,6 @@ class SOCKSProxyApp(tk.Tk):
     def _on_setting_changed(self):
         if not self._is_loading_config:
             self.save_config(CONFIG_FILE)
-            # Dynamically update DNS routing mode if already connected
             if self.is_connected and self.bridge:
                 remote_dns = self.remote_dns_var.get()
                 self.bridge.remote_dns = remote_dns
@@ -1391,34 +1372,6 @@ class SOCKSProxyApp(tk.Tk):
         self.log_area.insert("end", text + "\n")
         self.log_area.see("end")
         self.log_area.config(state="disabled")
-
-    # ----------------- Interactive Host Key Confirmation -----------------
-    def _confirm_ssh_host_dialog(self, prompt_text: str) -> bool:
-        """
-        Displays a thread-safe modal confirmation dialog on the Tkinter main thread
-        when OpenSSH asks whether to trust a new host fingerprint.
-        """
-        self.after(0, self.log, f"> [SSH Host Key Confirmation]\n{prompt_text}")
-        event = threading.Event()
-        result_box = {"approved": False}
-
-        def ask_on_main_thread():
-            msg = (
-                f"Обнаружен новый или неизвестный SSH-хост:\n\n"
-                f"{prompt_text}\n\n"
-                f"Вы доверяете этому хосту и хотите продолжить подключение (yes/no)?"
-            )
-            ans = messagebox.askyesno("Подтверждение SSH-хоста", msg, parent=self)
-            result_box["approved"] = bool(ans)
-            if ans:
-                self.log("> Host key confirmed by user (yes).")
-            else:
-                self.log("> Host key rejected by user (no).")
-            event.set()
-
-        self.after(0, ask_on_main_thread)
-        event.wait()
-        return result_box["approved"]
 
     # ----------------- Connection Diagnostics (TCP & UDP) -----------------
     def run_test(self):
@@ -1569,7 +1522,7 @@ class SOCKSProxyApp(tk.Tk):
         if self.askpass_server:
             self.askpass_server.close()
             self.askpass_server = None
-        for fname in ("askpass_temp.bat", "askpass_temp.sh"):
+        for fname in ("askpass_temp.bat", "askpass_temp.sh", "known_hosts_temp"):
             path = os.path.join(CONFIG_DIR, fname)
             if os.path.exists(path):
                 try:
@@ -1652,10 +1605,18 @@ class SOCKSProxyApp(tk.Tk):
 
         self.askpass_server = AskpassServer(
             password_getter=lambda: self.pass_entry.get(),
-            host_confirm_cb=self._confirm_ssh_host_dialog,
             log_cb=self.log
         )
         askpass_path = self._create_askpass_wrapper(self.askpass_server.port)
+
+        # Reset temporary known_hosts to 0 bytes so OpenSSH never sees key conflicts
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        temp_kh = os.path.join(CONFIG_DIR, "known_hosts_temp")
+        try:
+            with open(temp_kh, "w", encoding="utf-8"):
+                pass
+        except OSError:
+            pass
 
         ssh_cmd = [
             "ssh",
@@ -1664,7 +1625,10 @@ class SOCKSProxyApp(tk.Tk):
             "-p", ssh_port,
             "-N",
             "-v",
-            "-o", "StrictHostKeyChecking=ask",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=~/.socks5tunnel/known_hosts_temp",
+            "-o", "GlobalKnownHostsFile=~/.socks5tunnel/known_hosts_temp",
+            "-o", "CheckHostIP=no",
             "-o", "ConnectTimeout=12",
             "-o", "ServerAliveInterval=30"
         ]
@@ -1675,12 +1639,13 @@ class SOCKSProxyApp(tk.Tk):
         if use_compression:
             ssh_cmd.append("-C")
 
-        if resolved_ip and resolved_ip != host:
-            ssh_cmd.extend(["-o", f"HostKeyAlias={host}", f"{user}@{resolved_ip}"])
-        else:
-            ssh_cmd.append(f"{user}@{host}")
+        target_host = resolved_ip if resolved_ip else host
+        ssh_cmd.append(f"{user}@{target_host}")
 
         env = os.environ.copy()
+        home_dir = os.path.expanduser("~")
+        env["HOME"] = home_dir
+        env["USERPROFILE"] = home_dir
         env["SSH_ASKPASS"] = askpass_path
         env["SSH_ASKPASS_REQUIRE"] = "force"
         env["DISPLAY"] = "dummy:0"
@@ -1741,8 +1706,7 @@ class SOCKSProxyApp(tk.Tk):
                     break
             except OSError:
                 time.sleep(0.2)
-                if not (self.askpass_server and self.askpass_server.waiting_user_confirm):
-                    elapsed += 0.2
+                elapsed += 0.2
 
         if connected_ok:
             self.after(0, lambda: self._set_ui_state(True, socks_port, bypass))
@@ -1808,3 +1772,4 @@ if __name__ == "__main__":
 
     app = SOCKSProxyApp()
     app.mainloop()
+    
