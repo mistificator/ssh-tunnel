@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from urllib.parse import urlparse
 
 # Platform checks
@@ -34,6 +34,20 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
 REG_INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 INTERNET_OPTION_SETTINGS_CHANGED = 39
 INTERNET_OPTION_REFRESH = 37
+
+
+def normalize_bypass_items(raw_bypass: str) -> list[str]:
+    """Splits a raw bypass string (separated by newlines, semicolons, or commas) into clean items."""
+    if not raw_bypass:
+        return []
+    normalized = raw_bypass.replace("\r", "\n").replace(";", "\n").replace(",", "\n")
+    items = []
+    for line in normalized.splitlines():
+        clean = line.strip()
+        if clean and clean.lower() not in ("<local>", "localhost", "127.0.0.1", "127.0.0.0/8", "::1"):
+            if clean not in items:
+                items.append(clean)
+    return items
 
 
 # ----------------- Askpass Helper Mode (Subprocess Entry) -----------------
@@ -226,11 +240,8 @@ def read_windows_proxy_settings():
             try:
                 proxy_override, _ = winreg.QueryValueEx(key, "ProxyOverride")
                 if proxy_override:
-                    items = [
-                        x.strip() for x in proxy_override.split(";")
-                        if x.strip() and x.lower() not in ("<local>", "localhost", "127.0.0.1")
-                    ]
-                    bypass_list = ";".join(items)
+                    items = normalize_bypass_items(proxy_override)
+                    bypass_list = "\n".join(items)
             except FileNotFoundError:
                 pass
     except Exception as e:
@@ -258,10 +269,7 @@ def set_windows_proxy(
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_INTERNET_SETTINGS, 0, winreg.KEY_SET_VALUE) as key:
             if enabled:
                 proxy_server_val = f"socks=127.0.0.1:{socks_port}"
-                items = [
-                    x.strip() for x in bypass_list.replace("\n", ";").split(";")
-                    if x.strip() and x.lower() != "<local>"
-                ]
+                items = normalize_bypass_items(bypass_list)
                 for loop_host in ("localhost", "127.0.0.1"):
                     if loop_host not in items:
                         items.append(loop_host)
@@ -321,8 +329,8 @@ def read_linux_proxy_settings():
             import ast
             try:
                 raw_items = ast.literal_eval(out)
-                items = [x for x in raw_items if x not in ("localhost", "127.0.0.0/8", "::1")]
-                bypass_list = ";".join(items)
+                items = normalize_bypass_items("\n".join(str(x) for x in raw_items))
+                bypass_list = "\n".join(items)
             except Exception:
                 pass
     except Exception as e:
@@ -347,7 +355,7 @@ def set_linux_proxy(
             subprocess.run(["gsettings", "set", "org.gnome.system.proxy.socks", "host", "127.0.0.1"], check=False)
             subprocess.run(["gsettings", "set", "org.gnome.system.proxy.socks", "port", str(socks_port)], check=False)
 
-            items = [x.strip() for x in bypass_list.replace("\n", ";").replace(",", ";").split(";") if x.strip()]
+            items = normalize_bypass_items(bypass_list)
             if extra_bypass:
                 for eb in extra_bypass:
                     if eb and eb not in items:
@@ -658,10 +666,7 @@ class SocksUdpBridge:
         return bytes(data)
 
     def _generate_pac_script(self) -> bytes:
-        raw_items = [
-            x.strip() for x in self.bypass_list.replace("\n", ";").replace(",", ";").split(";")
-            if x.strip() and x.lower() not in ("<local>", "localhost", "127.0.0.1")
-        ]
+        raw_items = normalize_bypass_items(self.bypass_list)
         for eb in self.extra_bypass:
             if eb and eb not in raw_items:
                 raw_items.append(eb)
@@ -1079,10 +1084,10 @@ class SocksUdpBridge:
 
 
 # ----------------- GUI Application -----------------
-class SOCKSProxyApp(tk.Tk):
+class SSHTunnelApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SOCKS5 Tunnel")
+        self.title("SSH Tunnel")
         self.geometry("560x800")
         self.resizable(False, False)
         self.configure(bg="#1E1E24")
@@ -1095,9 +1100,31 @@ class SOCKSProxyApp(tk.Tk):
         self._is_testing = False
         self._current_extra_bypass = []
 
+        # Profile & Bypass state
+        self.profiles: dict[str, dict] = {}
+        self.current_profile: str = "Default"
+        self._bypass_items: list[str] = []
+        self._bypass_win: tk.Toplevel | None = None
+        self._bypass_editor: scrolledtext.ScrolledText | None = None
+
         self._build_ui()
         self.load_config(CONFIG_FILE)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    @staticmethod
+    def _default_profile_data(socks_port: str = "1080", bypass_list: str = "") -> dict:
+        return {
+            "host": "1.2.3.4",
+            "port": "22",
+            "user": "root",
+            "password": "",
+            "compression": True,
+            "socks_port": socks_port,
+            "remote_dns": True,
+            "bypass_list": "\n".join(normalize_bypass_items(bypass_list)),
+            "gateway": "disabled",
+            "udpgw_port": "7300"
+        }
 
     def _build_ui(self):
         # 1. Main toggle button & status area
@@ -1145,20 +1172,50 @@ class SOCKSProxyApp(tk.Tk):
         settings_frame.pack(fill="x", padx=15, pady=2)
         settings_frame.grid_columnconfigure(1, weight=1)
 
-        self._add_label(settings_frame, "SSH Host:", 0, 0)
-        self.host_entry = self._add_entry(settings_frame, "1.2.3.4", 0, 1, width=28)
+        # Row 0: Connection Profiles
+        self._add_label(settings_frame, "Profile:", 0, 0)
+        profile_bar = tk.Frame(settings_frame, bg="#1E1E24")
+        profile_bar.grid(row=0, column=1, columnspan=3, sticky="we", padx=3, pady=(2, 5))
 
-        self._add_label(settings_frame, "SSH Port:", 0, 2)
-        self.ssh_port_entry = self._add_entry(settings_frame, "22", 0, 3, width=7)
+        self.profile_var = tk.StringVar(value="Default")
+        self.profile_combo = ttk.Combobox(
+            profile_bar, textvariable=self.profile_var, state="readonly", width=22
+        )
+        self.profile_combo.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
 
-        self._add_label(settings_frame, "Username:", 1, 0)
-        self.user_entry = self._add_entry(settings_frame, "root", 1, 1, width=28)
+        tk.Button(
+            profile_bar, text="New", command=self.create_profile,
+            bg="#32353E", fg="#E0E0E0", relief="flat", padx=8, font=("Segoe UI", 8), cursor="hand2"
+        ).pack(side="left", padx=2)
 
-        self._add_label(settings_frame, "SOCKS5 Port:", 1, 2)
-        self.socks_port_entry = self._add_entry(settings_frame, "1080", 1, 3, width=7)
+        tk.Button(
+            profile_bar, text="Rename", command=self.rename_profile,
+            bg="#32353E", fg="#E0E0E0", relief="flat", padx=8, font=("Segoe UI", 8), cursor="hand2"
+        ).pack(side="left", padx=2)
 
-        self._add_label(settings_frame, "SSH Password:", 2, 0)
-        self.pass_entry = self._add_entry(settings_frame, "", 2, 1, width=28, show="*")
+        tk.Button(
+            profile_bar, text="Delete", command=self.delete_profile,
+            bg="#32353E", fg="#E0E0E0", relief="flat", padx=8, font=("Segoe UI", 8), cursor="hand2"
+        ).pack(side="left", padx=(2, 0))
+
+        # Row 1: SSH Host & SSH Port
+        self._add_label(settings_frame, "SSH Host:", 1, 0)
+        self.host_entry = self._add_entry(settings_frame, "1.2.3.4", 1, 1, width=28)
+
+        self._add_label(settings_frame, "SSH Port:", 1, 2)
+        self.ssh_port_entry = self._add_entry(settings_frame, "22", 1, 3, width=7)
+
+        # Row 2: Username & SOCKS5 Port
+        self._add_label(settings_frame, "Username:", 2, 0)
+        self.user_entry = self._add_entry(settings_frame, "root", 2, 1, width=28)
+
+        self._add_label(settings_frame, "SOCKS5 Port:", 2, 2)
+        self.socks_port_entry = self._add_entry(settings_frame, "1080", 2, 3, width=7)
+
+        # Row 3: SSH Password & Compression
+        self._add_label(settings_frame, "SSH Password:", 3, 0)
+        self.pass_entry = self._add_entry(settings_frame, "", 3, 1, width=28, show="*")
 
         self.compress_var = tk.BooleanVar(value=True)
         self.compress_chk = tk.Checkbutton(
@@ -1167,22 +1224,23 @@ class SOCKSProxyApp(tk.Tk):
             activebackground="#1E1E24", activeforeground="#FFFFFF",
             command=self._on_setting_changed
         )
-        self.compress_chk.grid(row=2, column=2, columnspan=2, sticky="w", padx=4)
+        self.compress_chk.grid(row=3, column=2, columnspan=2, sticky="w", padx=4)
 
-        self._add_label(settings_frame, "UDP Gateway:", 3, 0)
+        # Row 4: UDP Gateway & UDP Port
+        self._add_label(settings_frame, "UDP Gateway:", 4, 0)
         self.udp_gw_var = tk.StringVar(value="disabled")
         self.udp_gw_combo = ttk.Combobox(
             settings_frame, textvariable=self.udp_gw_var,
             values=["disabled", "badvpn-udpgw"], state="readonly", width=16
         )
-        self.udp_gw_combo.grid(row=3, column=1, sticky="w", padx=3, pady=2)
+        self.udp_gw_combo.grid(row=4, column=1, sticky="w", padx=3, pady=2)
         self.udp_gw_combo.bind("<<ComboboxSelected>>", lambda e: self._on_setting_changed())
 
-        self._add_label(settings_frame, "UDP Port:", 3, 2)
-        self.udpgw_port_entry = self._add_entry(settings_frame, "7300", 3, 3, width=7)
+        self._add_label(settings_frame, "UDP Port:", 4, 2)
+        self.udpgw_port_entry = self._add_entry(settings_frame, "7300", 4, 3, width=7)
 
-        # DNS routing option
-        self._add_label(settings_frame, "DNS Routing:", 4, 0)
+        # Row 5: DNS routing option
+        self._add_label(settings_frame, "DNS Routing:", 5, 0)
         self.remote_dns_var = tk.BooleanVar(value=True)
         self.remote_dns_chk = tk.Checkbutton(
             settings_frame,
@@ -1192,18 +1250,23 @@ class SOCKSProxyApp(tk.Tk):
             activebackground="#1E1E24", activeforeground="#FFFFFF",
             command=self._on_setting_changed
         )
-        self.remote_dns_chk.grid(row=4, column=1, columnspan=3, sticky="w", padx=1, pady=1)
+        self.remote_dns_chk.grid(row=5, column=1, columnspan=3, sticky="w", padx=1, pady=1)
 
-        self._add_label(settings_frame, "Bypass List:", 5, 0)
-        self.bypass_text = tk.Text(
-            settings_frame, height=3, width=38, bg="#2A2C35", fg="#FFFFFF",
-            insertbackground="white", relief="flat", font=("Consolas", 8), wrap="word"
+        # Row 6: Bypass List (opens in a separate window)
+        self._add_label(settings_frame, "Bypass List:", 6, 0)
+        bypass_frame = tk.Frame(settings_frame, bg="#1E1E24")
+        bypass_frame.grid(row=6, column=1, columnspan=3, sticky="we", padx=3, pady=3)
+
+        self.bypass_btn = tk.Button(
+            bypass_frame, text="Edit Bypass List... (0 rules)", command=self.open_bypass_window,
+            bg="#2A2C35", fg="#FFFFFF", activebackground="#3A3D4A", activeforeground="#FFFFFF",
+            relief="flat", padx=12, pady=3, font=("Segoe UI", 8), cursor="hand2", anchor="w"
         )
-        self.bypass_text.grid(row=5, column=1, columnspan=3, sticky="we", padx=3, pady=3)
-        self.bypass_text.bind("<KeyRelease>", lambda event: self._on_setting_changed())
+        self.bypass_btn.pack(side="left", fill="x", expand=True)
 
+        # Row 7: Action buttons
         io_btn_frame = tk.Frame(settings_frame, bg="#1E1E24")
-        io_btn_frame.grid(row=6, column=0, columnspan=4, pady=(6, 2), sticky="e")
+        io_btn_frame.grid(row=7, column=0, columnspan=4, pady=(6, 2), sticky="e")
 
         self.test_btn = tk.Button(
             io_btn_frame, text="⚡ Test", command=self.run_test,
@@ -1214,13 +1277,13 @@ class SOCKSProxyApp(tk.Tk):
 
         import_btn = tk.Button(
             io_btn_frame, text="Import .ini...", command=self.import_config,
-            bg="#32353E", fg="#E0E0E0", relief="flat", padx=8, font=("Segoe UI", 8)
+            bg="#32353E", fg="#E0E0E0", relief="flat", padx=8, font=("Segoe UI", 8), cursor="hand2"
         )
         import_btn.pack(side="left", padx=4)
 
         export_btn = tk.Button(
             io_btn_frame, text="Export .ini...", command=self.export_config,
-            bg="#32353E", fg="#E0E0E0", relief="flat", padx=8, font=("Segoe UI", 8)
+            bg="#32353E", fg="#E0E0E0", relief="flat", padx=8, font=("Segoe UI", 8), cursor="hand2"
         )
         export_btn.pack(side="left", padx=4)
 
@@ -1236,6 +1299,7 @@ class SOCKSProxyApp(tk.Tk):
             font=("Consolas", 8), state="disabled", wrap="word"
         )
         self.log_area.pack(fill="both", expand=True)
+        self._attach_log_context_menu(self.log_area)
 
     def _add_label(self, parent, text, r, c):
         lbl = tk.Label(parent, text=text, bg="#1E1E24", fg="#A0A5B5", font=("Segoe UI", 8))
@@ -1249,23 +1313,375 @@ class SOCKSProxyApp(tk.Tk):
         entry.insert(0, default_val)
         entry.grid(row=r, column=c, columnspan=columnspan, sticky="we", padx=3, pady=2)
         entry.bind("<KeyRelease>", lambda event: self._on_setting_changed())
+        if show == "*":
+            self._attach_password_context_menu(entry)
+        else:
+            self._attach_editable_context_menu(entry, is_text_widget=False)
         return entry
 
+    # ----------------- Context Menus for Text Fields -----------------
+    def _has_clipboard_text(self) -> bool:
+        try:
+            return bool(self.clipboard_get())
+        except tk.TclError:
+            return False
+
+    def _attach_editable_context_menu(self, widget: tk.Widget, is_text_widget: bool = False):
+        menu = tk.Menu(
+            widget, tearoff=0, bg="#2A2C35", fg="#FFFFFF",
+            activebackground="#2563EB", activeforeground="#FFFFFF", font=("Segoe UI", 9)
+        )
+
+        def has_selection() -> bool:
+            try:
+                if is_text_widget:
+                    return bool(widget.tag_ranges(tk.SEL))
+                return widget.selection_present()
+            except tk.TclError:
+                return False
+
+        def has_any_text() -> bool:
+            if is_text_widget:
+                return bool(widget.get("1.0", "end-1c"))
+            return bool(widget.get())
+
+        def do_cut():
+            widget.event_generate("<<Cut>>")
+            self.after(10, self._on_setting_changed)
+
+        def do_copy():
+            widget.event_generate("<<Copy>>")
+
+        def do_paste():
+            widget.event_generate("<<Paste>>")
+            self.after(10, self._on_setting_changed)
+
+        def do_delete():
+            try:
+                if is_text_widget:
+                    if widget.tag_ranges(tk.SEL):
+                        widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                else:
+                    if widget.selection_present():
+                        widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                self._on_setting_changed()
+            except tk.TclError:
+                pass
+
+        def do_select_all():
+            widget.focus_set()
+            if is_text_widget:
+                widget.tag_add(tk.SEL, "1.0", "end-1c")
+                widget.mark_set(tk.INSERT, "end-1c")
+            else:
+                widget.select_range(0, tk.END)
+                widget.icursor(tk.END)
+
+        menu.add_command(label="Cut", command=do_cut)
+        menu.add_command(label="Copy", command=do_copy)
+        menu.add_command(label="Paste", command=do_paste)
+        menu.add_command(label="Delete", command=do_delete)
+        menu.add_separator()
+        menu.add_command(label="Select All", command=do_select_all)
+
+        def show_menu(event):
+            widget.focus_set()
+            sel_state = "normal" if has_selection() else "disabled"
+            paste_state = "normal" if self._has_clipboard_text() else "disabled"
+            all_state = "normal" if has_any_text() else "disabled"
+
+            menu.entryconfig("Cut", state=sel_state)
+            menu.entryconfig("Copy", state=sel_state)
+            menu.entryconfig("Paste", state=paste_state)
+            menu.entryconfig("Delete", state=sel_state)
+            menu.entryconfig("Select All", state=all_state)
+            menu.tk_popup(event.x_root, event.y_root)
+
+        widget.bind("<Button-3>", show_menu)
+
+    def _attach_password_context_menu(self, entry: tk.Entry):
+        menu = tk.Menu(
+            entry, tearoff=0, bg="#2A2C35", fg="#FFFFFF",
+            activebackground="#2563EB", activeforeground="#FFFFFF", font=("Segoe UI", 9)
+        )
+
+        def toggle_visibility():
+            current_show = entry.cget("show")
+            entry.config(show="" if current_show == "*" else "*")
+
+        def do_copy():
+            entry.event_generate("<<Copy>>")
+
+        def do_paste():
+            entry.event_generate("<<Paste>>")
+            self.after(10, self._on_setting_changed)
+
+        def do_clear():
+            entry.delete(0, tk.END)
+            self._on_setting_changed()
+
+        def do_select_all():
+            entry.focus_set()
+            entry.select_range(0, tk.END)
+            entry.icursor(tk.END)
+
+        menu.add_command(label="Show Password", command=toggle_visibility)
+        menu.add_separator()
+        menu.add_command(label="Copy", command=do_copy)
+        menu.add_command(label="Paste", command=do_paste)
+        menu.add_command(label="Clear", command=do_clear)
+        menu.add_separator()
+        menu.add_command(label="Select All", command=do_select_all)
+
+        def show_menu(event):
+            entry.focus_set()
+            is_hidden = (entry.cget("show") == "*")
+            menu.entryconfig(0, label="Show Password" if is_hidden else "Hide Password")
+            has_sel = entry.selection_present()
+            has_text = bool(entry.get())
+            menu.entryconfig("Copy", state="normal" if (has_sel and not is_hidden) else "disabled")
+            menu.entryconfig("Paste", state="normal" if self._has_clipboard_text() else "disabled")
+            menu.entryconfig("Clear", state="normal" if has_text else "disabled")
+            menu.entryconfig("Select All", state="normal" if has_text else "disabled")
+            menu.tk_popup(event.x_root, event.y_root)
+
+        entry.bind("<Button-3>", show_menu)
+
+    def _attach_log_context_menu(self, text_widget: scrolledtext.ScrolledText):
+        menu = tk.Menu(
+            text_widget, tearoff=0, bg="#2A2C35", fg="#FFFFFF",
+            activebackground="#2563EB", activeforeground="#FFFFFF", font=("Segoe UI", 9)
+        )
+
+        def do_copy():
+            try:
+                selected = text_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+                self.clipboard_clear()
+                self.clipboard_append(selected)
+            except tk.TclError:
+                pass
+
+        def do_select_all():
+            text_widget.focus_set()
+            text_widget.tag_add(tk.SEL, "1.0", "end-1c")
+
+        def do_clear_log():
+            text_widget.config(state="normal")
+            text_widget.delete("1.0", tk.END)
+            text_widget.config(state="disabled")
+
+        menu.add_command(label="Copy", command=do_copy)
+        menu.add_command(label="Select All", command=do_select_all)
+        menu.add_separator()
+        menu.add_command(label="Clear Log", command=do_clear_log)
+
+        def show_menu(event):
+            text_widget.focus_set()
+            has_sel = bool(text_widget.tag_ranges(tk.SEL))
+            has_text = bool(text_widget.get("1.0", "end-1c").strip())
+            menu.entryconfig("Copy", state="normal" if has_sel else "disabled")
+            menu.entryconfig("Select All", state="normal" if has_text else "disabled")
+            menu.entryconfig("Clear Log", state="normal" if has_text else "disabled")
+            menu.tk_popup(event.x_root, event.y_root)
+
+        text_widget.bind("<Button-3>", show_menu)
+
+    # ----------------- Separate Bypass List Window -----------------
     def _get_bypass_val(self) -> str:
-        return self.bypass_text.get("1.0", "end-1c").strip()
+        return "\n".join(self._bypass_items)
 
     def _set_bypass_val(self, val: str):
-        self.bypass_text.delete("1.0", tk.END)
-        self.bypass_text.insert("1.0", val)
+        self._bypass_items = normalize_bypass_items(val)
+        count = len(self._bypass_items)
+        rule_word = "rule" if count == 1 else "rules"
+        self.bypass_btn.config(text=f"Edit Bypass List... ({count} {rule_word})")
+
+        if self._bypass_win is not None and self._bypass_win.winfo_exists() and self._bypass_editor is not None:
+            current_editor_items = normalize_bypass_items(self._bypass_editor.get("1.0", "end-1c"))
+            if current_editor_items != self._bypass_items:
+                self._bypass_editor.delete("1.0", tk.END)
+                self._bypass_editor.insert("1.0", "\n".join(self._bypass_items))
+
+    def open_bypass_window(self):
+        if self._bypass_win is not None and self._bypass_win.winfo_exists():
+            self._bypass_win.lift()
+            self._bypass_win.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Bypass List — SSH Tunnel")
+        win.geometry("420x380")
+        win.minsize(340, 260)
+        win.configure(bg="#1E1E24")
+        win.transient(self)
+        self._bypass_win = win
+
+        header_lbl = tk.Label(
+            win,
+            text="Enter hosts, domains, or subnets to bypass proxy (one entry per line):",
+            bg="#1E1E24", fg="#A0A5B5", font=("Segoe UI", 8, "bold"), anchor="w"
+        )
+        header_lbl.pack(fill="x", padx=12, pady=(10, 4))
+
+        editor = scrolledtext.ScrolledText(
+            win, bg="#2A2C35", fg="#FFFFFF", insertbackground="white",
+            relief="flat", font=("Consolas", 9), wrap="none"
+        )
+        editor.pack(fill="both", expand=True, padx=12, pady=4)
+        editor.insert("1.0", "\n".join(self._bypass_items))
+        self._bypass_editor = editor
+
+        def sync_from_editor(event=None):
+            raw_text = editor.get("1.0", "end-1c")
+            self._bypass_items = normalize_bypass_items(raw_text)
+            count = len(self._bypass_items)
+            rule_word = "rule" if count == 1 else "rules"
+            self.bypass_btn.config(text=f"Edit Bypass List... ({count} {rule_word})")
+            self._on_setting_changed()
+
+        editor.bind("<KeyRelease>", sync_from_editor)
+        self._attach_editable_context_menu(editor, is_text_widget=True)
+
+        btn_bar = tk.Frame(win, bg="#1E1E24")
+        btn_bar.pack(fill="x", padx=12, pady=(4, 10))
+
+        info_lbl = tk.Label(
+            btn_bar, text="Localhost addresses are bypassed automatically.",
+            bg="#1E1E24", fg="#8C93A4", font=("Segoe UI", 8)
+        )
+        info_lbl.pack(side="left")
+
+        def save_and_close():
+            sync_from_editor()
+            win.destroy()
+
+        close_btn = tk.Button(
+            btn_bar, text="Done", command=save_and_close,
+            bg="#2563EB", fg="#FFFFFF", activebackground="#1D4ED8", activeforeground="#FFFFFF",
+            relief="flat", padx=14, pady=2, font=("Segoe UI", 8, "bold"), cursor="hand2"
+        )
+        close_btn.pack(side="right")
+
+        win.protocol("WM_DELETE_WINDOW", save_and_close)
+        editor.focus_set()
+
+    # ----------------- Connection Profiles Management -----------------
+    def _collect_ui_profile_data(self) -> dict:
+        return {
+            "host": self.host_entry.get().strip(),
+            "port": self.ssh_port_entry.get().strip(),
+            "user": self.user_entry.get().strip(),
+            "password": self.pass_entry.get(),
+            "compression": bool(self.compress_var.get()),
+            "socks_port": self.socks_port_entry.get().strip(),
+            "remote_dns": bool(self.remote_dns_var.get()),
+            "bypass_list": self._get_bypass_val(),
+            "gateway": self.udp_gw_var.get(),
+            "udpgw_port": self.udpgw_port_entry.get().strip()
+        }
+
+    def _apply_profile_to_ui(self, profile_name: str):
+        data = self.profiles.get(profile_name, self._default_profile_data())
+        self._is_loading_config = True
+        try:
+            self.current_profile = profile_name
+            self.profile_var.set(profile_name)
+            self.profile_combo["values"] = list(self.profiles.keys())
+
+            self._set_entry_val(self.host_entry, data.get("host", "1.2.3.4"))
+            self._set_entry_val(self.ssh_port_entry, data.get("port", "22"))
+            self._set_entry_val(self.user_entry, data.get("user", "root"))
+            self._set_entry_val(self.pass_entry, data.get("password", ""))
+            self.compress_var.set(bool(data.get("compression", True)))
+
+            self._set_entry_val(self.socks_port_entry, data.get("socks_port", "1080"))
+            self.remote_dns_var.set(bool(data.get("remote_dns", True)))
+            self._set_bypass_val(data.get("bypass_list", ""))
+
+            self.udp_gw_var.set(data.get("gateway", "disabled"))
+            self._set_entry_val(self.udpgw_port_entry, data.get("udpgw_port", "7300"))
+        finally:
+            self._is_loading_config = False
+
+    def _on_profile_selected(self, event=None):
+        selected = self.profile_var.get().strip()
+        if not selected or selected == self.current_profile:
+            return
+        self.profiles[self.current_profile] = self._collect_ui_profile_data()
+        self._apply_profile_to_ui(selected)
+        self.save_config(CONFIG_FILE)
+        self.log(f"> Switched to profile: '{selected}'")
+
+    def create_profile(self):
+        name = simpledialog.askstring("New Profile", "Enter new profile name:", parent=self)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self.profiles:
+            messagebox.showwarning("Profile Exists", f"Profile '{name}' already exists!", parent=self)
+            return
+
+        # Save current profile and clone its settings as a convenient starting point
+        self.profiles[self.current_profile] = self._collect_ui_profile_data()
+        self.profiles[name] = dict(self.profiles[self.current_profile])
+        self._apply_profile_to_ui(name)
+        self.save_config(CONFIG_FILE)
+        self.log(f"> Created profile: '{name}'")
+
+    def rename_profile(self):
+        old_name = self.current_profile
+        new_name = simpledialog.askstring(
+            "Rename Profile", f"Enter new name for profile '{old_name}':",
+            initialvalue=old_name, parent=self
+        )
+        if not new_name:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == old_name:
+            return
+        if new_name in self.profiles:
+            messagebox.showwarning("Profile Exists", f"Profile '{new_name}' already exists!", parent=self)
+            return
+
+        # Preserve order of profiles
+        updated_profiles = {}
+        for k, v in self.profiles.items():
+            if k == old_name:
+                updated_profiles[new_name] = self._collect_ui_profile_data()
+            else:
+                updated_profiles[k] = v
+        self.profiles = updated_profiles
+        self._apply_profile_to_ui(new_name)
+        self.save_config(CONFIG_FILE)
+        self.log(f"> Renamed profile '{old_name}' -> '{new_name}'")
+
+    def delete_profile(self):
+        if len(self.profiles) <= 1:
+            messagebox.showwarning("Delete Profile", "Cannot delete the only remaining profile!", parent=self)
+            return
+
+        target = self.current_profile
+        if not messagebox.askyesno("Delete Profile", f"Delete profile '{target}'?", parent=self):
+            return
+
+        self.profiles.pop(target, None)
+        next_profile = next(iter(self.profiles.keys()))
+        self._apply_profile_to_ui(next_profile)
+        self.save_config(CONFIG_FILE)
+        self.log(f"> Deleted profile '{target}'. Active profile: '{next_profile}'")
 
     def _on_setting_changed(self):
         if not self._is_loading_config:
+            self.profiles[self.current_profile] = self._collect_ui_profile_data()
             self.save_config(CONFIG_FILE)
             if self.is_connected and self.bridge:
                 remote_dns = self.remote_dns_var.get()
-                self.bridge.remote_dns = remote_dns
                 socks_port = self.socks_port_entry.get().strip()
                 bypass = self._get_bypass_val()
+                self.bridge.remote_dns = remote_dns
+                self.bridge.bypass_list = bypass
                 set_system_proxy(
                     True,
                     socks_port=socks_port,
@@ -1274,28 +1690,54 @@ class SOCKSProxyApp(tk.Tk):
                     extra_bypass=self._current_extra_bypass
                 )
 
-    def save_config(self, filepath: str):
-        config = configparser.ConfigParser(comment_prefixes=('#',), inline_comment_prefixes=None)
-        raw_bypass = self._get_bypass_val()
-        items = [x.strip() for x in raw_bypass.replace("\n", ";").split(";") if x.strip()]
-        formatted_bypass = ("\n" + "\n".join(f"    {item}" for item in items)) if items else ""
+    @staticmethod
+    def _format_bypass_for_ini(bypass_str: str) -> str:
+        items = normalize_bypass_items(bypass_str)
+        return ("\n" + "\n".join(f"    {item}" for item in items)) if items else ""
 
+    def save_config(self, filepath: str, single_profile_only: bool = False):
+        self.profiles[self.current_profile] = self._collect_ui_profile_data()
+        config = configparser.ConfigParser(comment_prefixes=('#',), inline_comment_prefixes=None)
+
+        cur_data = self.profiles[self.current_profile]
+
+        # Keep standard [SSH], [PROXY], [UDP] sections for single-profile compatibility
         config["SSH"] = {
-            "host": self.host_entry.get().strip(),
-            "port": self.ssh_port_entry.get().strip(),
-            "user": self.user_entry.get().strip(),
-            "password": self.pass_entry.get(),
-            "compression": str(self.compress_var.get())
+            "host": cur_data["host"],
+            "port": cur_data["port"],
+            "user": cur_data["user"],
+            "password": cur_data["password"],
+            "compression": str(cur_data["compression"])
         }
         config["PROXY"] = {
-            "socks_port": self.socks_port_entry.get().strip(),
-            "remote_dns": str(self.remote_dns_var.get()),
-            "bypass_list": formatted_bypass
+            "socks_port": cur_data["socks_port"],
+            "remote_dns": str(cur_data["remote_dns"]),
+            "bypass_list": self._format_bypass_for_ini(cur_data["bypass_list"])
         }
         config["UDP"] = {
-            "gateway": self.udp_gw_var.get(),
-            "udpgw_port": self.udpgw_port_entry.get().strip()
+            "gateway": cur_data["gateway"],
+            "udpgw_port": cur_data["udpgw_port"]
         }
+
+        if not single_profile_only:
+            config["GENERAL"] = {
+                "active_profile": self.current_profile
+            }
+            for prof_name, pdata in self.profiles.items():
+                sec_name = f"PROFILE:{prof_name}"
+                config[sec_name] = {
+                    "host": pdata.get("host", "1.2.3.4"),
+                    "port": pdata.get("port", "22"),
+                    "user": pdata.get("user", "root"),
+                    "password": pdata.get("password", ""),
+                    "compression": str(pdata.get("compression", True)),
+                    "socks_port": pdata.get("socks_port", "1080"),
+                    "remote_dns": str(pdata.get("remote_dns", True)),
+                    "bypass_list": self._format_bypass_for_ini(pdata.get("bypass_list", "")),
+                    "gateway": pdata.get("gateway", "disabled"),
+                    "udpgw_port": pdata.get("udpgw_port", "7300")
+                }
+
         try:
             os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
             with open(filepath, "w", encoding="utf-8") as f:
@@ -1309,8 +1751,8 @@ class SOCKSProxyApp(tk.Tk):
         if not os.path.exists(filepath):
             self.log("> Config file not found. Reading settings from system proxy...")
             sys_port, sys_bypass = read_system_proxy_settings()
-            self._set_entry_val(self.socks_port_entry, sys_port)
-            self._set_bypass_val(sys_bypass)
+            self.profiles = {"Default": self._default_profile_data(sys_port, sys_bypass)}
+            self._apply_profile_to_ui("Default")
             self._is_loading_config = False
             self.save_config(filepath)
             return
@@ -1318,26 +1760,54 @@ class SOCKSProxyApp(tk.Tk):
         config = configparser.ConfigParser(comment_prefixes=('#',), inline_comment_prefixes=None)
         try:
             config.read(filepath, encoding="utf-8")
-            ssh_sec = config["SSH"] if "SSH" in config else {}
-            proxy_sec = config["PROXY"] if "PROXY" in config else {}
-            udp_sec = config["UDP"] if "UDP" in config else {}
+            loaded_profiles = {}
 
-            self._set_entry_val(self.host_entry, ssh_sec.get("host", "1.2.3.4"))
-            self._set_entry_val(self.ssh_port_entry, ssh_sec.get("port", "22"))
-            self._set_entry_val(self.user_entry, ssh_sec.get("user", "root"))
-            self._set_entry_val(self.pass_entry, ssh_sec.get("password", ""))
-            self.compress_var.set(ssh_sec.getboolean("compression", fallback=True))
+            for sec in config.sections():
+                if sec.startswith("PROFILE:"):
+                    prof_name = sec[len("PROFILE:"):].strip()
+                    if not prof_name:
+                        continue
+                    s = config[sec]
+                    loaded_profiles[prof_name] = {
+                        "host": s.get("host", "1.2.3.4"),
+                        "port": s.get("port", "22"),
+                        "user": s.get("user", "root"),
+                        "password": s.get("password", ""),
+                        "compression": s.getboolean("compression", fallback=True),
+                        "socks_port": s.get("socks_port", "1080"),
+                        "remote_dns": s.getboolean("remote_dns", fallback=True),
+                        "bypass_list": "\n".join(normalize_bypass_items(s.get("bypass_list", ""))),
+                        "gateway": s.get("gateway", "disabled"),
+                        "udpgw_port": s.get("udpgw_port", "7300")
+                    }
 
-            self._set_entry_val(self.socks_port_entry, proxy_sec.get("socks_port", "1080"))
-            self.remote_dns_var.set(proxy_sec.getboolean("remote_dns", fallback=True))
-            raw_bypass = proxy_sec.get("bypass_list", "")
-            items = [line.strip() for line in raw_bypass.splitlines() if line.strip()]
-            self._set_bypass_val(";".join(items))
+            # Fallback for legacy single-profile .ini files
+            if not loaded_profiles:
+                ssh_sec = config["SSH"] if "SSH" in config else {}
+                proxy_sec = config["PROXY"] if "PROXY" in config else {}
+                udp_sec = config["UDP"] if "UDP" in config else {}
+                loaded_profiles["Default"] = {
+                    "host": ssh_sec.get("host", "1.2.3.4"),
+                    "port": ssh_sec.get("port", "22"),
+                    "user": ssh_sec.get("user", "root"),
+                    "password": ssh_sec.get("password", ""),
+                    "compression": ssh_sec.getboolean("compression", fallback=True) if hasattr(ssh_sec, "getboolean") else True,
+                    "socks_port": proxy_sec.get("socks_port", "1080"),
+                    "remote_dns": proxy_sec.getboolean("remote_dns", fallback=True) if hasattr(proxy_sec, "getboolean") else True,
+                    "bypass_list": "\n".join(normalize_bypass_items(proxy_sec.get("bypass_list", ""))),
+                    "gateway": udp_sec.get("gateway", "disabled"),
+                    "udpgw_port": udp_sec.get("udpgw_port", "7300")
+                }
 
-            self.udp_gw_var.set(udp_sec.get("gateway", "disabled"))
-            self._set_entry_val(self.udpgw_port_entry, udp_sec.get("udpgw_port", "7300"))
+            active_prof = "Default"
+            if "GENERAL" in config:
+                active_prof = config["GENERAL"].get("active_profile", "Default")
+            if active_prof not in loaded_profiles:
+                active_prof = next(iter(loaded_profiles.keys()))
 
-            self.log(f"> Settings loaded from: {os.path.basename(filepath)}")
+            self.profiles = loaded_profiles
+            self._apply_profile_to_ui(active_prof)
+            self.log(f"> Settings loaded from: {os.path.basename(filepath)} (Profile: {active_prof})")
         except Exception as e:
             self.log(f"> Error reading {filepath}: {e}")
         finally:
@@ -1350,22 +1820,65 @@ class SOCKSProxyApp(tk.Tk):
     def export_config(self):
         filepath = filedialog.asksaveasfilename(
             defaultextension=".ini",
+            initialfile=f"{self.current_profile}.ini",
             filetypes=[("INI files", "*.ini"), ("All files", "*.*")],
-            title="Export settings to file"
+            title="Export profile to file"
         )
         if filepath:
-            self.save_config(filepath)
-            messagebox.showinfo("Export", f"Settings exported successfully to:\n{filepath}")
+            self.save_config(filepath, single_profile_only=True)
+            messagebox.showinfo("Export", f"Profile '{self.current_profile}' exported successfully to:\n{filepath}")
 
     def import_config(self):
         filepath = filedialog.askopenfilename(
             filetypes=[("INI files", "*.ini"), ("All files", "*.*")],
-            title="Import settings from file"
+            title="Import profile from file"
         )
-        if filepath:
-            self.load_config(filepath)
+        if not filepath:
+            return
+
+        config = configparser.ConfigParser(comment_prefixes=('#',), inline_comment_prefixes=None)
+        try:
+            config.read(filepath, encoding="utf-8")
+            ssh_sec = config["SSH"] if "SSH" in config else {}
+            proxy_sec = config["PROXY"] if "PROXY" in config else {}
+            udp_sec = config["UDP"] if "UDP" in config else {}
+
+            imported_data = {
+                "host": ssh_sec.get("host", "1.2.3.4"),
+                "port": ssh_sec.get("port", "22"),
+                "user": ssh_sec.get("user", "root"),
+                "password": ssh_sec.get("password", ""),
+                "compression": ssh_sec.getboolean("compression", fallback=True) if hasattr(ssh_sec, "getboolean") else True,
+                "socks_port": proxy_sec.get("socks_port", "1080"),
+                "remote_dns": proxy_sec.getboolean("remote_dns", fallback=True) if hasattr(proxy_sec, "getboolean") else True,
+                "bypass_list": "\n".join(normalize_bypass_items(proxy_sec.get("bypass_list", ""))),
+                "gateway": udp_sec.get("gateway", "disabled"),
+                "udpgw_port": udp_sec.get("udpgw_port", "7300")
+            }
+
+            base_name = os.path.splitext(os.path.basename(filepath))[0].strip() or "Imported"
+            prof_name = base_name
+            if prof_name in self.profiles:
+                ans = messagebox.askyesno(
+                    "Import Profile",
+                    f"Overwrite existing profile '{prof_name}'?\n"
+                    f"(Click 'No' to import as a new profile)",
+                    parent=self
+                )
+                if not ans:
+                    idx = 2
+                    while f"{base_name} ({idx})" in self.profiles:
+                        idx += 1
+                    prof_name = f"{base_name} ({idx})"
+
+            self.profiles[self.current_profile] = self._collect_ui_profile_data()
+            self.profiles[prof_name] = imported_data
+            self._apply_profile_to_ui(prof_name)
             self.save_config(CONFIG_FILE)
-            messagebox.showinfo("Import", f"Settings loaded successfully from:\n{filepath}")
+            self.log(f"> Imported profile '{prof_name}' from {os.path.basename(filepath)}")
+            messagebox.showinfo("Import", f"Profile '{prof_name}' loaded successfully from:\n{filepath}")
+        except Exception as e:
+            messagebox.showerror("Import Error", f"Failed to import {filepath}:\n{e}")
 
     def log(self, text: str):
         self.log_area.config(state="normal")
@@ -1422,7 +1935,7 @@ class SOCKSProxyApp(tk.Tk):
 
                 http_req = (
                     b"HEAD / HTTP/1.1\r\nHost: google.com\r\n"
-                    b"User-Agent: SOCKS-Tester\r\nConnection: close\r\n\r\n"
+                    b"User-Agent: SSH-Tunnel-Tester\r\nConnection: close\r\n\r\n"
                 )
                 tcp_sock.sendall(http_req)
 
@@ -1650,7 +2163,7 @@ class SOCKSProxyApp(tk.Tk):
         env["SSH_ASKPASS_REQUIRE"] = "force"
         env["DISPLAY"] = "dummy:0"
 
-        self.log(f"> Starting SSH: {' '.join(ssh_cmd)}")
+        self.log(f"> Starting SSH ({self.current_profile}): {' '.join(ssh_cmd)}")
 
         try:
             startupinfo = None
@@ -1764,12 +2277,10 @@ class SOCKSProxyApp(tk.Tk):
         self.stop_tunnel()
         self.destroy()
 
-
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--askpass-client":
         run_askpass_client()
         sys.exit(0)
 
-    app = SOCKSProxyApp()
+    app = SSHTunnelApp()
     app.mainloop()
-    
