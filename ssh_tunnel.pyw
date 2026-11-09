@@ -1,8 +1,11 @@
 import configparser
+import gzip
+import http.client
 import json
 import os
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -10,7 +13,9 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+from urllib.request import url2pathname
+import zlib
 
 # Platform checks
 IS_WINDOWS = sys.platform.startswith("win")
@@ -29,6 +34,16 @@ else:
 # Cross-platform config path: ~/.socks5tunnel/config.ini
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".socks5tunnel")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
+
+# Default AdGuard DNS Filter & well-known presets
+DEFAULT_ADBLOCK_FILTER = "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
+KNOWN_ADBLOCK_FILTERS = [
+    DEFAULT_ADBLOCK_FILTER,
+    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+    "https://big.oisd.nl/domainswild",
+    "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext",
+    "https://someonewhocares.org/hosts/zero/hosts",
+]
 
 # Windows Internet Settings Constants
 REG_INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
@@ -133,6 +148,61 @@ def _skip_dns_name(data: bytes, offset: int) -> int:
     return offset
 
 
+def parse_dns_question_domain(data: bytes) -> tuple[str | None, int, int]:
+    """
+    Extracts (domain, qtype, question_end_offset) from the first Question of a raw DNS packet.
+    """
+    if len(data) < 12:
+        return None, 0, 0
+    qdcount = struct.unpack("!H", data[4:6])[0]
+    if qdcount < 1:
+        return None, 0, 0
+
+    offset = 12
+    labels = []
+    while offset < len(data):
+        length = data[offset]
+        if length == 0:
+            offset += 1
+            break
+        if (length & 0xC0) == 0xC0:
+            offset += 2
+            break
+        offset += 1
+        if offset + length > len(data):
+            return None, 0, 0
+        labels.append(data[offset:offset + length].decode("ascii", errors="ignore"))
+        offset += length
+
+    if offset + 4 > len(data) or not labels:
+        return None, 0, 0
+    qtype, _ = struct.unpack("!HH", data[offset:offset + 4])
+    offset += 4
+    return ".".join(labels).lower().strip("."), qtype, offset
+
+
+def build_dns_sinkhole_response(query_data: bytes) -> bytes | None:
+    """Builds a synthetic DNS response (0.0.0.0 for A queries, empty NOERROR for others)."""
+    domain, qtype, q_end = parse_dns_question_domain(query_data)
+    if not domain or q_end == 0:
+        return None
+
+    tx_id = query_data[:2]
+    req_flags = struct.unpack("!H", query_data[2:4])[0]
+    rd_bit = req_flags & 0x0100
+    resp_flags = 0x8000 | rd_bit | 0x0080  # QR=1, RA=1, RCODE=0 (NOERROR)
+    question_section = query_data[12:q_end]
+
+    if qtype == 1:  # A record -> 0.0.0.0
+        header = tx_id + struct.pack("!HHHHH", resp_flags, 1, 1, 0, 0)
+        # Name pointer to 0x000c, Type A (1), Class IN (1), TTL 300s, Len 4, IP 0.0.0.0
+        answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 300, 4) + b"\x00\x00\x00\x00"
+        return header + question_section + answer
+    else:
+        header = tx_id + struct.pack("!HHHHH", resp_flags, 1, 0, 0, 0)
+        return header + question_section
+
+
 def parse_dns_a_response(data: bytes, tx_id: bytes = b"\x42\x42") -> str | None:
     """Extracts the first IPv4 A-record from a raw DNS response packet (supports CNAME chains)."""
     if len(data) < 12 or data[:2] != tx_id:
@@ -196,6 +266,400 @@ def resolve_host_ipv4(host: str) -> tuple[str | None, bool]:
             continue
 
     return None, False
+
+
+# ----------------- DNS AdBlock Filter Engine -----------------
+class AdBlockEngine:
+    """
+    Parses and evaluates DNS adblock filter lists:
+    - AdGuard DNS / Adblock syntax (||domain.com^, @@||domain.com^, $important, etc.)
+    - Standard /etc/hosts syntax (0.0.0.0 domain.com, 127.0.0.1 domain.com)
+    - Dnsmasq / SmartDNS syntax (address=/domain.com/0.0.0.0, server=/domain.com/)
+    - Plain domain / wildcard domain lists (domain.com, *.domain.com)
+    Supports loading from local files and downloading via the SSH SOCKS5 tunnel.
+    """
+    IGNORE_HOSTS = {
+        "localhost", "localhost.localdomain", "local", "broadcasthost",
+        "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix",
+        "ip6-allnodes", "ip6-allrouters", "ip6-allhosts", "0.0.0.0", "127.0.0.1", "::1"
+    }
+    ALLOWED_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789.-_")
+
+    def __init__(self, log_cb):
+        self.log_cb = log_cb
+        self.lock = threading.Lock()
+        self.blocked_domains: set[str] = set()
+        self.allowed_domains: set[str] = set()
+        self.blocked_hits: int = 0
+        self._recent_logged: dict[str, float] = {}
+        self.last_source_loaded: str = ""
+
+    @property
+    def rule_count(self) -> int:
+        with self.lock:
+            return len(self.blocked_domains)
+
+    @property
+    def exception_count(self) -> int:
+        with self.lock:
+            return len(self.allowed_domains)
+
+    @classmethod
+    def _clean_valid_domain(cls, raw: str) -> str | None:
+        d = raw.strip().lower().strip(".")
+        if d.startswith("*."):
+            d = d[2:].strip(".")
+        if not d or "." not in d or len(d) > 253:
+            return None
+        if d in cls.IGNORE_HOSTS or is_ipv4_address(d):
+            return None
+        if not all(ch in cls.ALLOWED_CHARS for ch in d):
+            return None
+        if ".." in d or d.startswith("-") or d.endswith("-"):
+            return None
+        return d
+
+    @classmethod
+    def parse_filter_text(cls, text: str) -> tuple[set[str], set[str]]:
+        blocked: set[str] = set()
+        allowed: set[str] = set()
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("!") or line.startswith("#") or line.startswith("["):
+                continue
+            if line.startswith("/") and line.endswith("/"):
+                continue  # Skip regex rules
+
+            # 1. AdGuard / Adblock Exception rules: @@||example.com^
+            if line.startswith("@@"):
+                rule = line[2:].strip()
+                rule, has_mod, modifiers = rule.partition("$")
+                if has_mod and "badfilter" in modifiers.lower():
+                    continue
+                for prefix in ("||", "|http://", "|https://", "|", "http://", "https://", "://"):
+                    if rule.startswith(prefix):
+                        rule = rule[len(prefix):]
+                        break
+                if "^" in rule:
+                    rule, _, rest = rule.partition("^")
+                    if rest and rest != "/":
+                        continue
+                rule = rule.rstrip("/")
+                if "/" in rule:
+                    continue
+                d = cls._clean_valid_domain(rule)
+                if d:
+                    allowed.add(d)
+                continue
+
+            # 2. Dnsmasq / Unbound syntax: address=/example.com/0.0.0.0 or server=/example.com/
+            if line.startswith(("address=/", "server=/", "local=/")):
+                parts = line.split("/")
+                if len(parts) >= 2:
+                    d = cls._clean_valid_domain(parts[1])
+                    if d:
+                        blocked.add(d)
+                continue
+
+            # 3. AdGuard / Adblock domain rules: ||example.com^ or example.com^
+            if line.startswith("||") or "^" in line or "$" in line:
+                rule, has_mod, modifiers = line.partition("$")
+                if has_mod:
+                    mod_lower = modifiers.lower()
+                    if "badfilter" in mod_lower or "ctag=" in mod_lower or "client=" in mod_lower:
+                        continue
+                    # Skip non-blocking rewrite rules (unless rewriting to 0.0.0.0 / 127.0.0.1 / NXDOMAIN)
+                    if "dnsrewrite=" in mod_lower:
+                        if not any(x in mod_lower for x in ("0.0.0.0", "127.0.0.1", "nxdomain", "refused", "noerror")):
+                            continue
+
+                if rule.startswith("||"):
+                    rule = rule[2:]
+                elif rule.startswith("|"):
+                    continue  # Skip URL-prefix rules like |http://...
+
+                if "^" in rule:
+                    rule, _, rest = rule.partition("^")
+                    if rest and rest != "/":
+                        continue  # URL path after ^, not a pure domain rule
+                rule = rule.rstrip("/")
+                if "/" in rule:
+                    continue  # URL path rule (e.g. ||site.com/ads.js), do not block whole domain
+
+                d = cls._clean_valid_domain(rule)
+                if d:
+                    blocked.add(d)
+                continue
+
+            # Strip inline comments for hosts / plain domain lines
+            if "#" in line:
+                line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+
+            # 4. Hosts file format: 0.0.0.0 example.com / 127.0.0.1 example.com
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::1", "::"):
+                for token in parts[1:]:
+                    d = cls._clean_valid_domain(token)
+                    if d:
+                        blocked.add(d)
+                continue
+
+            # 5. Plain domain or wildcard domain list: example.com or *.example.com
+            if len(parts) == 1:
+                d = cls._clean_valid_domain(parts[0])
+                if d:
+                    blocked.add(d)
+
+        return blocked, allowed
+
+    def is_blocked(self, domain: str, log_hit: bool = True) -> bool:
+        """
+        Checks if domain (or any parent domain) is blocked, respecting @@ exception rules.
+        Walks from most specific subdomain to least specific parent domain.
+        """
+        clean = domain.strip().lower().strip(".")
+        if not clean or is_ipv4_address(clean):
+            return False
+
+        labels = clean.split(".")
+        if len(labels) < 2:
+            return False
+
+        matched_rule = None
+        now = time.time()
+        should_log = False
+        total_hits = 0
+
+        with self.lock:
+            if not self.blocked_domains:
+                return False
+
+            for i in range(len(labels) - 1):
+                candidate = ".".join(labels[i:])
+                if candidate in self.allowed_domains:
+                    return False
+                if candidate in self.blocked_domains:
+                    matched_rule = candidate
+                    break
+
+            if matched_rule is None:
+                return False
+
+            self.blocked_hits += 1
+            total_hits = self.blocked_hits
+            if log_hit:
+                last_t = self._recent_logged.get(clean, 0.0)
+                if now - last_t >= 15.0:
+                    self._recent_logged[clean] = now
+                    if len(self._recent_logged) > 500:
+                        self._recent_logged.clear()
+                    should_log = True
+
+        if should_log and self.log_cb:
+            rule_info = f" (rule: {matched_rule})" if matched_rule != clean else ""
+            self.log_cb(f"> [AdBlock] Blocked: {clean}{rule_info} [total: {total_hits}]")
+
+        return True
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
+        data = bytearray()
+        while len(data) < n:
+            try:
+                chunk = sock.recv(n - len(data))
+                if not chunk:
+                    return None
+                data.extend(chunk)
+            except Exception:
+                return None
+        return bytes(data)
+
+    def _download_via_ssh_socks5(
+        self,
+        url: str,
+        internal_ssh_port: int,
+        dns_resolver_fn,
+        max_redirects: int = 5
+    ) -> str:
+        """Downloads an HTTP/HTTPS filter URL strictly through the local SSH SOCKS5 listener."""
+        current_url = url
+        for _ in range(max_redirects + 1):
+            parsed = urlparse(current_url)
+            scheme = parsed.scheme.lower()
+            if scheme not in ("http", "https"):
+                raise ValueError(f"Unsupported URL scheme: {scheme}")
+
+            host = parsed.hostname
+            if not host:
+                raise ValueError(f"Invalid URL hostname in: {current_url}")
+            port = parsed.port or (443 if scheme == "https" else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+
+            # Resolve filter host via SSH tunnel DNS first
+            resolved_ip_bytes = dns_resolver_fn(host) if dns_resolver_fn else None
+
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            raw_sock.settimeout(15.0)
+            sock = raw_sock
+            try:
+                raw_sock.connect(("127.0.0.1", internal_ssh_port))
+                raw_sock.sendall(b"\x05\x01\x00")
+                if self._recv_exact(raw_sock, 2) != b"\x05\x00":
+                    raise RuntimeError("SSH SOCKS5 handshake failed while fetching filter")
+
+                if resolved_ip_bytes:
+                    req = b"\x05\x01\x00\x01" + resolved_ip_bytes + struct.pack("!H", port)
+                else:
+                    host_b = host.encode("idna")
+                    req = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + struct.pack("!H", port)
+
+                raw_sock.sendall(req)
+                resp_hdr = self._recv_exact(raw_sock, 4)
+                if not resp_hdr or resp_hdr[1] != 0:
+                    code = resp_hdr[1] if resp_hdr and len(resp_hdr) > 1 else "?"
+                    raise RuntimeError(f"SOCKS5 connect to {host}:{port} failed (code {code})")
+
+                atyp = resp_hdr[3]
+                if atyp == 1:
+                    self._recv_exact(raw_sock, 6)
+                elif atyp == 3:
+                    dlen_b = self._recv_exact(raw_sock, 1)
+                    if dlen_b:
+                        self._recv_exact(raw_sock, dlen_b[0] + 2)
+                elif atyp == 4:
+                    self._recv_exact(raw_sock, 18)
+
+                if scheme == "https":
+                    ctx = ssl.create_default_context()
+                    sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+                    sock.settimeout(20.0)
+
+                host_hdr = f"{host}:{port}" if parsed.port else host
+                http_req = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host_hdr}\r\n"
+                    "User-Agent: Mozilla/5.0 (compatible; SSHTunnel-AdBlock/1.0)\r\n"
+                    "Accept: text/plain, */*\r\n"
+                    "Accept-Encoding: gzip, deflate\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("utf-8")
+                sock.sendall(http_req)
+
+                http_resp = http.client.HTTPResponse(sock, method="GET")
+                http_resp.begin()
+                status = http_resp.status
+
+                if status in (301, 302, 303, 307, 308):
+                    location = http_resp.getheader("Location")
+                    http_resp.close()
+                    if not location:
+                        raise RuntimeError(f"HTTP {status} redirect without Location header")
+                    current_url = urljoin(current_url, location)
+                    continue
+
+                if status != 200:
+                    reason = http_resp.reason
+                    http_resp.close()
+                    raise RuntimeError(f"HTTP {status} {reason}")
+
+                body = http_resp.read(30 * 1024 * 1024)  # Up to 30 MB limit
+                content_enc = (http_resp.getheader("Content-Encoding") or "").lower()
+                http_resp.close()
+
+                if "gzip" in content_enc:
+                    body = gzip.decompress(body)
+                elif "deflate" in content_enc:
+                    try:
+                        body = zlib.decompress(body)
+                    except zlib.error:
+                        body = zlib.decompress(body, -zlib.MAX_WBITS)
+
+                return body.decode("utf-8", errors="ignore")
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        raise RuntimeError("Too many HTTP redirects while downloading AdBlock filter")
+
+    def load_from_source(
+        self,
+        source_spec: str,
+        internal_ssh_port: int | None = None,
+        dns_resolver_fn=None
+    ) -> tuple[bool, int, int]:
+        """
+        Loads one or multiple filter sources (separated by ';').
+        Internet URLs (http://, https://) are downloaded via the SSH tunnel.
+        Local paths (or file://) are read from disk.
+        Returns (success, blocked_count, exception_count).
+        """
+        raw_sources = [s.strip() for s in source_spec.split(";") if s.strip()]
+        if not raw_sources:
+            with self.lock:
+                self.blocked_domains.clear()
+                self.allowed_domains.clear()
+            return False, 0, 0
+
+        total_blocked: set[str] = set()
+        total_allowed: set[str] = set()
+        any_loaded = False
+
+        for src in raw_sources:
+            try:
+                if src.lower().startswith(("http://", "https://")):
+                    if not internal_ssh_port:
+                        self.log_cb(f"> [AdBlock] Waiting for SSH tunnel to download filter: {src}")
+                        continue
+                    self.log_cb(f"> [AdBlock] Downloading filter through SSH tunnel: {src} ...")
+                    t0 = time.perf_counter()
+                    content = self._download_via_ssh_socks5(src, internal_ssh_port, dns_resolver_fn)
+                    dt = time.perf_counter() - t0
+                    b_set, a_set = self.parse_filter_text(content)
+                    total_blocked.update(b_set)
+                    total_allowed.update(a_set)
+                    any_loaded = True
+                    size_kb = len(content.encode("utf-8", errors="ignore")) / 1024.0
+                    self.log_cb(
+                        f"> [AdBlock] Downloaded via tunnel ({size_kb:.0f} KB in {dt:.1f}s): "
+                        f"{len(b_set):,} blocked domains, {len(a_set):,} exceptions."
+                    )
+                else:
+                    local_path = src
+                    if local_path.lower().startswith("file://"):
+                        local_path = url2pathname(urlparse(local_path).path)
+                    local_path = os.path.expandvars(os.path.expanduser(local_path))
+                    if not os.path.isfile(local_path):
+                        self.log_cb(f"> [AdBlock] Local filter file not found: {local_path}")
+                        continue
+                    with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                    b_set, a_set = self.parse_filter_text(content)
+                    total_blocked.update(b_set)
+                    total_allowed.update(a_set)
+                    any_loaded = True
+                    self.log_cb(
+                        f"> [AdBlock] Loaded local filter '{os.path.basename(local_path)}': "
+                        f"{len(b_set):,} blocked domains, {len(a_set):,} exceptions."
+                    )
+            except Exception as e:
+                self.log_cb(f"> [AdBlock] Error loading filter '{src}': {e}")
+
+        if any_loaded:
+            with self.lock:
+                self.blocked_domains = total_blocked
+                self.allowed_domains = total_allowed
+                self.last_source_loaded = source_spec
+            return True, len(total_blocked), len(total_allowed)
+
+        return False, self.rule_count, self.exception_count
 
 
 # ----------------- Windows Proxy Helpers -----------------
@@ -594,13 +1058,13 @@ class BadVpnClient:
         self._close_sock()
 
 
-# ----------------- SOCKS, PAC & UDP Bridge -----------------
+# ----------------- SOCKS, PAC, AdBlock & UDP Bridge -----------------
 class SocksUdpBridge:
     """
-    Local SOCKS5/SOCKS4 & PAC Bridge:
+    Local SOCKS5/SOCKS4, PAC & AdBlock Bridge:
     - Serves /proxy.pac on HTTP GET so browsers use SOCKS5 with Remote DNS.
-    - When remote_dns=True, resolves SOCKS5 ATYP=3 (domain) and SOCKS4a requests
-      to IPv4 (A-records) inside the SSH tunnel and connects via ATYP=1 (IPv4).
+    - When remote_dns=True, checks domains against AdBlockEngine and resolves
+      allowed domains to IPv4 (A-records) inside the SSH tunnel.
     - Handles SOCKS5 UDP ASSOCIATE and routes datagrams to badvpn-udpgw.
     """
     def __init__(
@@ -610,6 +1074,8 @@ class SocksUdpBridge:
         udpgw_port: int,
         enable_udp: bool,
         remote_dns: bool,
+        adblock_enabled: bool,
+        adblock_engine: AdBlockEngine,
         bypass_list: str,
         extra_bypass: list[str],
         log_cb
@@ -619,6 +1085,8 @@ class SocksUdpBridge:
         self.udpgw_port = udpgw_port
         self.enable_udp = enable_udp
         self.remote_dns = remote_dns
+        self.adblock_enabled = adblock_enabled
+        self.adblock_engine = adblock_engine
         self.bypass_list = bypass_list
         self.extra_bypass = extra_bypass or []
         self.log_cb = log_cb
@@ -641,12 +1109,24 @@ class SocksUdpBridge:
             self.udp_server.bind(('127.0.0.1', socks_port))
             self.badvpn_client = BadVpnClient(udpgw_port, self.udp_server, log_cb)
 
+    def clear_dns_cache(self):
+        with self.dns_lock:
+            self.dns_cache.clear()
+
+    def is_domain_blocked(self, domain: str) -> bool:
+        if not (self.remote_dns and self.adblock_enabled and self.adblock_engine):
+            return False
+        return self.adblock_engine.is_blocked(domain, log_hit=True)
+
     def start(self):
         threading.Thread(target=self._tcp_accept_loop, daemon=True).start()
         if self.enable_udp and self.udp_server:
             threading.Thread(target=self._udp_relay_loop, daemon=True).start()
         mode_str = "TCP/UDP" if self.enable_udp else "TCP"
-        dns_str = "Remote Tunnel DNS -> IPv4" if self.remote_dns else "Local DNS"
+        if self.remote_dns:
+            dns_str = "Remote Tunnel DNS + AdBlock" if self.adblock_enabled else "Remote Tunnel DNS -> IPv4"
+        else:
+            dns_str = "Local DNS"
         self.log_cb(
             f"> SOCKS5 bridge ({mode_str} :{self.socks_port} -> SSH :{self.internal_ssh_port}, {dns_str}) started."
         )
@@ -751,16 +1231,19 @@ class SocksUdpBridge:
                 pass
         return None
 
-    def _resolve_via_ssh_tcp(self, domain: str) -> bytes | None:
+    def _resolve_via_ssh_tcp(self, domain: str, bypass_adblock: bool = False) -> bytes | None:
         """
         Resolves a domain name to an IPv4 address (4 bytes) inside the SSH tunnel.
-        Includes TTL caching and in-flight request deduplication for parallel browser requests.
+        Includes AdBlock check, TTL caching, and in-flight request deduplication.
         """
-        domain = domain.strip().lower()
+        domain = domain.strip().lower().strip(".")
         if not domain:
             return None
         if is_ipv4_address(domain):
             return socket.inet_aton(domain)
+
+        if not bypass_adblock and self.is_domain_blocked(domain):
+            return b"\x00\x00\x00\x00"
 
         now = time.time()
         wait_event = None
@@ -913,7 +1396,15 @@ class SocksUdpBridge:
                             break
                         domain_buf.extend(b_ch)
                     domain = domain_buf.decode("utf-8", errors="ignore")
+                    if self.is_domain_blocked(domain):
+                        client_sock.sendall(b"\x00\x5b\x00\x00\x00\x00\x00\x00")
+                        client_sock.close()
+                        return
                     resolved = self._resolve_via_ssh_tcp(domain) if self.remote_dns else None
+                    if resolved == b"\x00\x00\x00\x00":
+                        client_sock.sendall(b"\x00\x5b\x00\x00\x00\x00\x00\x00")
+                        client_sock.close()
+                        return
                     if resolved:
                         out_packet = b"\x04" + bytes([cmd]) + port_bytes + resolved + bytes(userid)
                     else:
@@ -972,9 +1463,19 @@ class SocksUdpBridge:
                         return
 
                     domain = domain_bytes.decode("utf-8", errors="ignore")
+                    if self.is_domain_blocked(domain):
+                        # Reply 0x02: Connection not allowed by ruleset
+                        client_sock.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+                        client_sock.close()
+                        return
+
                     resolved_ipv4 = None
                     if self.remote_dns and cmd == 1:
                         resolved_ipv4 = self._resolve_via_ssh_tcp(domain)
+                        if resolved_ipv4 == b"\x00\x00\x00\x00":
+                            client_sock.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+                            client_sock.close()
+                            return
 
                     if resolved_ipv4:
                         out_req = b"\x05" + bytes([cmd]) + b"\x00\x01" + resolved_ipv4 + dst_port
@@ -1051,9 +1552,13 @@ class SocksUdpBridge:
                     offset += 1
                     domain = data[offset:offset + d_len].decode('utf-8', errors='ignore')
                     offset += d_len
+                    if self.is_domain_blocked(domain):
+                        continue
                     dest_ip_bytes = None
                     if self.remote_dns:
                         dest_ip_bytes = self._resolve_via_ssh_tcp(domain)
+                        if dest_ip_bytes == b"\x00\x00\x00\x00":
+                            continue
                     if not dest_ip_bytes:
                         dest_ip_bytes = socket.inet_aton(socket.gethostbyname(domain))
                 else:
@@ -1062,11 +1567,28 @@ class SocksUdpBridge:
                 dest_port = struct.unpack("!H", data[offset:offset + 2])[0]
                 payload = data[offset + 2:]
 
+                # Intercept raw UDP DNS queries (port 53) for blocked domains
+                if dest_port == 53 and self.remote_dns and self.adblock_enabled:
+                    qdomain, _, _ = parse_dns_question_domain(payload)
+                    if qdomain and self.is_domain_blocked(qdomain):
+                        sinkhole_pkt = build_dns_sinkhole_response(payload)
+                        if sinkhole_pkt:
+                            socks5_hdr = b"\x00\x00\x00\x01" + dest_ip_bytes + struct.pack("!H", 53)
+                            try:
+                                self.udp_sock_send(socks5_hdr + sinkhole_pkt, addr)
+                            except Exception:
+                                pass
+                        continue
+
                 if self.badvpn_client:
                     self.badvpn_client.send_packet(addr, dest_ip_bytes, dest_port, payload)
             except Exception:
                 if not self.running:
                     break
+
+    def udp_sock_send(self, pkt: bytes, addr):
+        if self.udp_server:
+            self.udp_server.sendto(pkt, addr)
 
     def stop(self):
         self.running = False
@@ -1088,7 +1610,7 @@ class SSHTunnelApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SSH Tunnel")
-        self.geometry("560x800")
+        self.geometry("560x840")
         self.resizable(False, False)
         self.configure(bg="#1E1E24")
 
@@ -1098,7 +1620,10 @@ class SSHTunnelApp(tk.Tk):
         self.askpass_server = None
         self._is_loading_config = False
         self._is_testing = False
+        self._is_loading_adblock = False
         self._current_extra_bypass = []
+
+        self.adblock_engine = AdBlockEngine(log_cb=lambda msg: self.after(0, self.log, msg))
 
         # Profile & Bypass state
         self.profiles: dict[str, dict] = {}
@@ -1121,6 +1646,8 @@ class SSHTunnelApp(tk.Tk):
             "compression": True,
             "socks_port": socks_port,
             "remote_dns": True,
+            "adblock_enabled": True,
+            "adblock_filter": DEFAULT_ADBLOCK_FILTER,
             "bypass_list": "\n".join(normalize_bypass_items(bypass_list)),
             "gateway": "disabled",
             "udpgw_port": "7300"
@@ -1128,10 +1655,10 @@ class SSHTunnelApp(tk.Tk):
 
     def _build_ui(self):
         # 1. Main toggle button & status area
-        btn_frame = tk.Frame(self, bg="#1E1E24", pady=8)
+        btn_frame = tk.Frame(self, bg="#1E1E24", pady=6)
         btn_frame.pack(fill="x")
 
-        self.canvas_size = 115
+        self.canvas_size = 110
         self.canvas = tk.Canvas(
             btn_frame,
             width=self.canvas_size,
@@ -1248,14 +1775,65 @@ class SSHTunnelApp(tk.Tk):
             variable=self.remote_dns_var,
             bg="#1E1E24", fg="#FFFFFF", selectcolor="#2B2D33",
             activebackground="#1E1E24", activeforeground="#FFFFFF",
-            command=self._on_setting_changed
+            command=self._on_dns_or_adblock_toggled
         )
         self.remote_dns_chk.grid(row=5, column=1, columnspan=3, sticky="w", padx=1, pady=1)
 
-        # Row 6: Bypass List (opens in a separate window)
-        self._add_label(settings_frame, "Bypass List:", 6, 0)
+        # Row 6: DNS AdBlock option
+        self._add_label(settings_frame, "DNS AdBlock:", 6, 0)
+        adblock_top_bar = tk.Frame(settings_frame, bg="#1E1E24")
+        adblock_top_bar.grid(row=6, column=1, columnspan=3, sticky="we", padx=1, pady=1)
+
+        self.adblock_var = tk.BooleanVar(value=True)
+        self.adblock_chk = tk.Checkbutton(
+            adblock_top_bar,
+            text="Block ads & trackers via DNS filter",
+            variable=self.adblock_var,
+            bg="#1E1E24", fg="#FFFFFF", selectcolor="#2B2D33",
+            activebackground="#1E1E24", activeforeground="#FFFFFF",
+            disabledforeground="#606575",
+            command=self._on_dns_or_adblock_toggled
+        )
+        self.adblock_chk.pack(side="left")
+
+        self.adblock_status_lbl = tk.Label(
+            adblock_top_bar, text="(AdGuard DNS)", bg="#1E1E24", fg="#10B981", font=("Segoe UI", 8)
+        )
+        self.adblock_status_lbl.pack(side="left", padx=(6, 0))
+
+        # Row 7: AdBlock Filter URL or Local Path
+        self._add_label(settings_frame, "Filter Source:", 7, 0)
+        adblock_src_bar = tk.Frame(settings_frame, bg="#1E1E24")
+        adblock_src_bar.grid(row=7, column=1, columnspan=3, sticky="we", padx=3, pady=2)
+
+        self.adblock_filter_var = tk.StringVar(value=DEFAULT_ADBLOCK_FILTER)
+        self.adblock_filter_combo = ttk.Combobox(
+            adblock_src_bar,
+            textvariable=self.adblock_filter_var,
+            values=KNOWN_ADBLOCK_FILTERS,
+            width=28
+        )
+        self.adblock_filter_combo.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.adblock_filter_combo.bind("<<ComboboxSelected>>", lambda e: self._on_adblock_source_changed(reload_now=True))
+        self.adblock_filter_combo.bind("<KeyRelease>", lambda e: self._on_setting_changed())
+        self._attach_editable_context_menu(self.adblock_filter_combo, is_text_widget=False)
+
+        self.adblock_file_btn = tk.Button(
+            adblock_src_bar, text="File...", command=self.browse_adblock_file,
+            bg="#32353E", fg="#E0E0E0", relief="flat", padx=7, font=("Segoe UI", 8), cursor="hand2"
+        )
+        self.adblock_file_btn.pack(side="left", padx=2)
+
+        self.adblock_reload_btn = tk.Button(
+            adblock_src_bar, text="↻ Reload", command=self.reload_adblock_filter_async,
+            bg="#32353E", fg="#E0E0E0", relief="flat", padx=7, font=("Segoe UI", 8), cursor="hand2"
+        )
+        self.adblock_reload_btn.pack(side="left", padx=(2, 0))
+
+        # Row 8: Bypass List (opens in a separate window)
+        self._add_label(settings_frame, "Bypass List:", 8, 0)
         bypass_frame = tk.Frame(settings_frame, bg="#1E1E24")
-        bypass_frame.grid(row=6, column=1, columnspan=3, sticky="we", padx=3, pady=3)
+        bypass_frame.grid(row=8, column=1, columnspan=3, sticky="we", padx=3, pady=3)
 
         self.bypass_btn = tk.Button(
             bypass_frame, text="Edit Bypass List... (0 rules)", command=self.open_bypass_window,
@@ -1264,9 +1842,9 @@ class SSHTunnelApp(tk.Tk):
         )
         self.bypass_btn.pack(side="left", fill="x", expand=True)
 
-        # Row 7: Action buttons
+        # Row 9: Action buttons
         io_btn_frame = tk.Frame(settings_frame, bg="#1E1E24")
-        io_btn_frame.grid(row=7, column=0, columnspan=4, pady=(6, 2), sticky="e")
+        io_btn_frame.grid(row=9, column=0, columnspan=4, pady=(6, 2), sticky="e")
 
         self.test_btn = tk.Button(
             io_btn_frame, text="⚡ Test", command=self.run_test,
@@ -1318,6 +1896,108 @@ class SSHTunnelApp(tk.Tk):
         else:
             self._attach_editable_context_menu(entry, is_text_widget=False)
         return entry
+
+    # ----------------- AdBlock UI & Loader Helpers -----------------
+    def _update_adblock_ui_state(self):
+        remote_dns_on = bool(self.remote_dns_var.get())
+        adblock_on = bool(self.adblock_var.get())
+
+        if not remote_dns_on:
+            self.adblock_chk.config(state="disabled")
+            self.adblock_filter_combo.config(state="disabled")
+            self.adblock_file_btn.config(state="disabled")
+            self.adblock_reload_btn.config(state="disabled")
+            self.adblock_status_lbl.config(text="(Requires Remote DNS)", fg="#8C93A4")
+        else:
+            self.adblock_chk.config(state="normal")
+            sub_state = "normal" if adblock_on else "disabled"
+            self.adblock_filter_combo.config(state=sub_state)
+            self.adblock_file_btn.config(state=sub_state)
+            self.adblock_reload_btn.config(state=sub_state)
+            if not adblock_on:
+                self.adblock_status_lbl.config(text="(Disabled)", fg="#8C93A4")
+            else:
+                rc = self.adblock_engine.rule_count
+                if rc > 0:
+                    self.adblock_status_lbl.config(text=f"({rc:,} rules active)", fg="#10B981")
+                else:
+                    self.adblock_status_lbl.config(text="(Loads via tunnel on connect)", fg="#F59E0B")
+
+    def _on_dns_or_adblock_toggled(self):
+        self._update_adblock_ui_state()
+        self._on_setting_changed()
+        if self.is_connected and self.remote_dns_var.get() and self.adblock_var.get():
+            if self.adblock_engine.rule_count == 0:
+                self.reload_adblock_filter_async()
+
+    def _on_adblock_source_changed(self, reload_now: bool = False):
+        self._on_setting_changed()
+        if reload_now:
+            self.reload_adblock_filter_async()
+
+    def browse_adblock_file(self):
+        filepath = filedialog.askopenfilename(
+            filetypes=[("Filter / Hosts files", "*.txt *.list *.hosts *.*"), ("All files", "*.*")],
+            title="Select local DNS AdBlock filter file"
+        )
+        if filepath:
+            self.adblock_filter_var.set(filepath)
+            self._on_adblock_source_changed(reload_now=True)
+
+    def reload_adblock_filter_async(self):
+        if self._is_loading_adblock:
+            return
+        if not (self.remote_dns_var.get() and self.adblock_var.get()):
+            return
+
+        source = self.adblock_filter_var.get().strip()
+        if not source:
+            source = DEFAULT_ADBLOCK_FILTER
+            self.adblock_filter_var.set(source)
+
+        is_remote_url = any(
+            s.strip().lower().startswith(("http://", "https://"))
+            for s in source.split(";") if s.strip()
+        )
+        if is_remote_url and not (self.is_connected and self.bridge):
+            self.log("> [AdBlock] Filter URL saved. It will be downloaded through the SSH tunnel upon connection.")
+            self._update_adblock_ui_state()
+            return
+
+        self._is_loading_adblock = True
+        self.adblock_status_lbl.config(text="(Loading filter...)", fg="#F59E0B")
+        self.adblock_reload_btn.config(state="disabled")
+
+        def worker():
+            try:
+                ssh_port = self.bridge.internal_ssh_port if self.bridge else None
+                resolver_fn = (
+                    (lambda d: self.bridge._resolve_via_ssh_tcp(d, bypass_adblock=True))
+                    if self.bridge else None
+                )
+                ok, b_count, _ = self.adblock_engine.load_from_source(
+                    source_spec=source,
+                    internal_ssh_port=ssh_port,
+                    dns_resolver_fn=resolver_fn
+                )
+                if self.bridge:
+                    self.bridge.clear_dns_cache()
+
+                def finish_ui():
+                    self._is_loading_adblock = False
+                    self._update_adblock_ui_state()
+                    if not ok and b_count == 0:
+                        self.adblock_status_lbl.config(text="(Load failed — check log)", fg="#EF4444")
+
+                self.after(0, finish_ui)
+            except Exception as e:
+                def err_ui():
+                    self._is_loading_adblock = False
+                    self._update_adblock_ui_state()
+                    self.log(f"> [AdBlock] Unexpected error: {e}")
+                self.after(0, err_ui)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ----------------- Context Menus for Text Fields -----------------
     def _has_clipboard_text(self) -> bool:
@@ -1575,6 +2255,8 @@ class SSHTunnelApp(tk.Tk):
             "compression": bool(self.compress_var.get()),
             "socks_port": self.socks_port_entry.get().strip(),
             "remote_dns": bool(self.remote_dns_var.get()),
+            "adblock_enabled": bool(self.adblock_var.get()),
+            "adblock_filter": self.adblock_filter_var.get().strip() or DEFAULT_ADBLOCK_FILTER,
             "bypass_list": self._get_bypass_val(),
             "gateway": self.udp_gw_var.get(),
             "udpgw_port": self.udpgw_port_entry.get().strip()
@@ -1596,10 +2278,13 @@ class SSHTunnelApp(tk.Tk):
 
             self._set_entry_val(self.socks_port_entry, data.get("socks_port", "1080"))
             self.remote_dns_var.set(bool(data.get("remote_dns", True)))
+            self.adblock_var.set(bool(data.get("adblock_enabled", True)))
+            self.adblock_filter_var.set(data.get("adblock_filter", DEFAULT_ADBLOCK_FILTER) or DEFAULT_ADBLOCK_FILTER)
             self._set_bypass_val(data.get("bypass_list", ""))
 
             self.udp_gw_var.set(data.get("gateway", "disabled"))
             self._set_entry_val(self.udpgw_port_entry, data.get("udpgw_port", "7300"))
+            self._update_adblock_ui_state()
         finally:
             self._is_loading_config = False
 
@@ -1623,7 +2308,6 @@ class SSHTunnelApp(tk.Tk):
             messagebox.showwarning("Profile Exists", f"Profile '{name}' already exists!", parent=self)
             return
 
-        # Save current profile and clone its settings as a convenient starting point
         self.profiles[self.current_profile] = self._collect_ui_profile_data()
         self.profiles[name] = dict(self.profiles[self.current_profile])
         self._apply_profile_to_ui(name)
@@ -1645,7 +2329,6 @@ class SSHTunnelApp(tk.Tk):
             messagebox.showwarning("Profile Exists", f"Profile '{new_name}' already exists!", parent=self)
             return
 
-        # Preserve order of profiles
         updated_profiles = {}
         for k, v in self.profiles.items():
             if k == old_name:
@@ -1678,10 +2361,13 @@ class SSHTunnelApp(tk.Tk):
             self.save_config(CONFIG_FILE)
             if self.is_connected and self.bridge:
                 remote_dns = self.remote_dns_var.get()
+                adblock_enabled = self.adblock_var.get()
                 socks_port = self.socks_port_entry.get().strip()
                 bypass = self._get_bypass_val()
                 self.bridge.remote_dns = remote_dns
+                self.bridge.adblock_enabled = adblock_enabled
                 self.bridge.bypass_list = bypass
+                self.bridge.clear_dns_cache()
                 set_system_proxy(
                     True,
                     socks_port=socks_port,
@@ -1712,6 +2398,8 @@ class SSHTunnelApp(tk.Tk):
         config["PROXY"] = {
             "socks_port": cur_data["socks_port"],
             "remote_dns": str(cur_data["remote_dns"]),
+            "adblock_enabled": str(cur_data["adblock_enabled"]),
+            "adblock_filter": cur_data["adblock_filter"],
             "bypass_list": self._format_bypass_for_ini(cur_data["bypass_list"])
         }
         config["UDP"] = {
@@ -1733,6 +2421,8 @@ class SSHTunnelApp(tk.Tk):
                     "compression": str(pdata.get("compression", True)),
                     "socks_port": pdata.get("socks_port", "1080"),
                     "remote_dns": str(pdata.get("remote_dns", True)),
+                    "adblock_enabled": str(pdata.get("adblock_enabled", True)),
+                    "adblock_filter": pdata.get("adblock_filter", DEFAULT_ADBLOCK_FILTER),
                     "bypass_list": self._format_bypass_for_ini(pdata.get("bypass_list", "")),
                     "gateway": pdata.get("gateway", "disabled"),
                     "udpgw_port": pdata.get("udpgw_port", "7300")
@@ -1776,6 +2466,8 @@ class SSHTunnelApp(tk.Tk):
                         "compression": s.getboolean("compression", fallback=True),
                         "socks_port": s.get("socks_port", "1080"),
                         "remote_dns": s.getboolean("remote_dns", fallback=True),
+                        "adblock_enabled": s.getboolean("adblock_enabled", fallback=True),
+                        "adblock_filter": s.get("adblock_filter", DEFAULT_ADBLOCK_FILTER),
                         "bypass_list": "\n".join(normalize_bypass_items(s.get("bypass_list", ""))),
                         "gateway": s.get("gateway", "disabled"),
                         "udpgw_port": s.get("udpgw_port", "7300")
@@ -1794,6 +2486,8 @@ class SSHTunnelApp(tk.Tk):
                     "compression": ssh_sec.getboolean("compression", fallback=True) if hasattr(ssh_sec, "getboolean") else True,
                     "socks_port": proxy_sec.get("socks_port", "1080"),
                     "remote_dns": proxy_sec.getboolean("remote_dns", fallback=True) if hasattr(proxy_sec, "getboolean") else True,
+                    "adblock_enabled": proxy_sec.getboolean("adblock_enabled", fallback=True) if hasattr(proxy_sec, "getboolean") else True,
+                    "adblock_filter": proxy_sec.get("adblock_filter", DEFAULT_ADBLOCK_FILTER),
                     "bypass_list": "\n".join(normalize_bypass_items(proxy_sec.get("bypass_list", ""))),
                     "gateway": udp_sec.get("gateway", "disabled"),
                     "udpgw_port": udp_sec.get("udpgw_port", "7300")
@@ -1851,6 +2545,8 @@ class SSHTunnelApp(tk.Tk):
                 "compression": ssh_sec.getboolean("compression", fallback=True) if hasattr(ssh_sec, "getboolean") else True,
                 "socks_port": proxy_sec.get("socks_port", "1080"),
                 "remote_dns": proxy_sec.getboolean("remote_dns", fallback=True) if hasattr(proxy_sec, "getboolean") else True,
+                "adblock_enabled": proxy_sec.getboolean("adblock_enabled", fallback=True) if hasattr(proxy_sec, "getboolean") else True,
+                "adblock_filter": proxy_sec.get("adblock_filter", DEFAULT_ADBLOCK_FILTER),
                 "bypass_list": "\n".join(normalize_bypass_items(proxy_sec.get("bypass_list", ""))),
                 "gateway": udp_sec.get("gateway", "disabled"),
                 "udpgw_port": udp_sec.get("udpgw_port", "7300")
@@ -1952,7 +2648,16 @@ class SSHTunnelApp(tk.Tk):
             tcp_status = "Error"
             self.log(f"> [TCP Test] ERROR: {e}")
 
-        # 2. Test UDP via DNS request to 8.8.8.8:53
+        # 2. Test AdBlock status if enabled
+        if self.remote_dns_var.get() and self.adblock_var.get():
+            rc = self.adblock_engine.rule_count
+            ec = self.adblock_engine.exception_count
+            if rc > 0:
+                self.log(f"> [AdBlock Test] ACTIVE: {rc:,} blocked domains, {ec:,} exceptions loaded.")
+            else:
+                self.log("> [AdBlock Test] Filter is currently loading or has 0 rules.")
+
+        # 3. Test UDP via DNS request to 8.8.8.8:53
         udp_ok = False
         udp_ms = 0.0
         udp_status = ""
@@ -2077,6 +2782,7 @@ class SSHTunnelApp(tk.Tk):
         bypass = self._get_bypass_val()
         use_compression = self.compress_var.get()
         remote_dns = self.remote_dns_var.get()
+        adblock_enabled = self.adblock_var.get()
         udp_gw = self.udp_gw_var.get()
         udpgw_port = self.udpgw_port_entry.get().strip()
 
@@ -2107,9 +2813,11 @@ class SSHTunnelApp(tk.Tk):
                 udpgw_port=int(udpgw_port) if udpgw_port.isdigit() else 7300,
                 enable_udp=enable_udp,
                 remote_dns=remote_dns,
+                adblock_enabled=adblock_enabled,
+                adblock_engine=self.adblock_engine,
                 bypass_list=bypass,
                 extra_bypass=self._current_extra_bypass,
-                log_cb=self.log
+                log_cb=lambda msg: self.after(0, self.log, msg)
             )
             self.bridge.start()
         except Exception as e:
@@ -2118,7 +2826,7 @@ class SSHTunnelApp(tk.Tk):
 
         self.askpass_server = AskpassServer(
             password_getter=lambda: self.pass_entry.get(),
-            log_cb=self.log
+            log_cb=lambda msg: self.after(0, self.log, msg)
         )
         askpass_path = self._create_askpass_wrapper(self.askpass_server.port)
 
@@ -2253,6 +2961,11 @@ class SSHTunnelApp(tk.Tk):
             )
             dns_mode = "Remote Tunnel DNS -> IPv4" if remote_dns else "Local DNS"
             self.log(f"> System proxy enabled ({dns_mode}).")
+
+            # Load / download AdBlock filter through the active SSH tunnel
+            if remote_dns and self.adblock_var.get():
+                self.reload_adblock_filter_async()
+
             self.after(600, self.run_test)
         else:
             self.canvas.itemconfig(self.circle_btn, fill="#4A4E58", outline="#2B2D33")
@@ -2276,6 +2989,11 @@ class SSHTunnelApp(tk.Tk):
     def on_close(self):
         self.stop_tunnel()
         self.destroy()
+
+
+# Backward-compatible alias
+SOCKSProxyApp = SSHTunnelApp
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--askpass-client":
