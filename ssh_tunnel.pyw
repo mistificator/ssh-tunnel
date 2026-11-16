@@ -1,3 +1,4 @@
+from collections import deque
 import configparser
 import gzip
 import http.client
@@ -63,6 +64,155 @@ def normalize_bypass_items(raw_bypass: str) -> list[str]:
             if clean not in items:
                 items.append(clean)
     return items
+
+
+def format_speed(bps: float) -> str:
+    """Formats bytes/sec into a human-readable speed string."""
+    if bps < 0:
+        bps = 0.0
+    if bps < 1024.0:
+        return f"{bps:.0f} B/s"
+    if bps < 1024.0 * 1024.0:
+        return f"{bps / 1024.0:.1f} KB/s"
+    if bps < 1024.0 * 1024.0 * 1024.0:
+        return f"{bps / (1024.0 * 1024.0):.2f} MB/s"
+    return f"{bps / (1024.0 * 1024.0 * 1024.0):.2f} GB/s"
+
+
+def format_bytes(num_bytes: int) -> str:
+    """Formats total byte count into a human-readable size string."""
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024.0:.1f} KB"
+    if num_bytes < 1024 * 1024 * 1024:
+        return f"{num_bytes / (1024.0 * 1024.0):.2f} MB"
+    return f"{num_bytes / (1024.0 * 1024.0 * 1024.0):.2f} GB"
+
+
+def nice_scale_ceiling(peak_bps: float) -> float:
+    """Computes a clean auto-scaling Y-axis ceiling (minimum 1 KB/s)."""
+    min_scale = 1024.0  # 1 KB/s floor
+    if peak_bps <= min_scale:
+        return min_scale
+
+    units = [
+        1024.0,                      # KB/s
+        1024.0 * 1024.0,             # MB/s
+        1024.0 * 1024.0 * 1024.0,    # GB/s
+    ]
+    steps = (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000)
+    target = peak_bps * 1.08
+    for unit in units:
+        for step in steps:
+            candidate = step * unit
+            if candidate >= target:
+                return candidate
+    return target
+
+
+# ----------------- Real-Time Traffic Monitor (5-Minute History) -----------------
+class TrafficMonitor:
+    """
+    Thread-safe accumulator for TCP and UDP traffic with a 5-minute (300s) rolling history.
+    """
+    HISTORY_SECONDS = 300  # 5 minutes at 1-second intervals
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.tcp_rx_total = 0
+        self.tcp_tx_total = 0
+        self.udp_rx_total = 0
+        self.udp_tx_total = 0
+
+        self._last_tcp_rx = 0
+        self._last_tcp_tx = 0
+        self._last_udp_rx = 0
+        self._last_udp_tx = 0
+        self._last_tick_ts = time.perf_counter()
+
+        self.tcp_history: deque[float] = deque([0.0] * self.HISTORY_SECONDS, maxlen=self.HISTORY_SECONDS)
+        self.udp_history: deque[float] = deque([0.0] * self.HISTORY_SECONDS, maxlen=self.HISTORY_SECONDS)
+
+    def add_tcp_rx(self, n: int):
+        if n > 0:
+            with self.lock:
+                self.tcp_rx_total += n
+
+    def add_tcp_tx(self, n: int):
+        if n > 0:
+            with self.lock:
+                self.tcp_tx_total += n
+
+    def add_udp_rx(self, n: int):
+        if n > 0:
+            with self.lock:
+                self.udp_rx_total += n
+
+    def add_udp_tx(self, n: int):
+        if n > 0:
+            with self.lock:
+                self.udp_tx_total += n
+
+    def reset(self):
+        with self.lock:
+            self.tcp_rx_total = 0
+            self.tcp_tx_total = 0
+            self.udp_rx_total = 0
+            self.udp_tx_total = 0
+            self._last_tcp_rx = 0
+            self._last_tcp_tx = 0
+            self._last_udp_rx = 0
+            self._last_udp_tx = 0
+            self._last_tick_ts = time.perf_counter()
+            self.tcp_history = deque([0.0] * self.HISTORY_SECONDS, maxlen=self.HISTORY_SECONDS)
+            self.udp_history = deque([0.0] * self.HISTORY_SECONDS, maxlen=self.HISTORY_SECONDS)
+
+    def sample_tick(self) -> dict:
+        """Calculates current 1-second speeds, appends to 5-minute history, and returns a snapshot."""
+        now = time.perf_counter()
+        with self.lock:
+            dt = max(now - self._last_tick_ts, 0.05)
+            self._last_tick_ts = now
+
+            d_tcp_rx = max(0, self.tcp_rx_total - self._last_tcp_rx)
+            d_tcp_tx = max(0, self.tcp_tx_total - self._last_tcp_tx)
+            d_udp_rx = max(0, self.udp_rx_total - self._last_udp_rx)
+            d_udp_tx = max(0, self.udp_tx_total - self._last_udp_tx)
+
+            self._last_tcp_rx = self.tcp_rx_total
+            self._last_tcp_tx = self.tcp_tx_total
+            self._last_udp_rx = self.udp_rx_total
+            self._last_udp_tx = self.udp_tx_total
+
+            tcp_rx_bps = d_tcp_rx / dt
+            tcp_tx_bps = d_tcp_tx / dt
+            tcp_bps = tcp_rx_bps + tcp_tx_bps
+
+            udp_rx_bps = d_udp_rx / dt
+            udp_tx_bps = d_udp_tx / dt
+            udp_bps = udp_rx_bps + udp_tx_bps
+
+            self.tcp_history.append(tcp_bps)
+            self.udp_history.append(udp_bps)
+
+            tcp_hist_list = list(self.tcp_history)
+            udp_hist_list = list(self.udp_history)
+
+            return {
+                "tcp_bps": tcp_bps,
+                "tcp_rx_bps": tcp_rx_bps,
+                "tcp_tx_bps": tcp_tx_bps,
+                "tcp_total": self.tcp_rx_total + self.tcp_tx_total,
+                "tcp_peak_5m": max(tcp_hist_list) if tcp_hist_list else 0.0,
+                "tcp_history": tcp_hist_list,
+                "udp_bps": udp_bps,
+                "udp_rx_bps": udp_rx_bps,
+                "udp_tx_bps": udp_tx_bps,
+                "udp_total": self.udp_rx_total + self.udp_tx_total,
+                "udp_peak_5m": max(udp_hist_list) if udp_hist_list else 0.0,
+                "udp_history": udp_hist_list,
+            }
 
 
 # ----------------- Askpass Helper Mode (Subprocess Entry) -----------------
@@ -195,7 +345,6 @@ def build_dns_sinkhole_response(query_data: bytes) -> bytes | None:
 
     if qtype == 1:  # A record -> 0.0.0.0
         header = tx_id + struct.pack("!HHHHH", resp_flags, 1, 1, 0, 0)
-        # Name pointer to 0x000c, Type A (1), Class IN (1), TTL 300s, Len 4, IP 0.0.0.0
         answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 300, 4) + b"\x00\x00\x00\x00"
         return header + question_section + answer
     else:
@@ -285,8 +434,9 @@ class AdBlockEngine:
     }
     ALLOWED_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789.-_")
 
-    def __init__(self, log_cb):
+    def __init__(self, log_cb, traffic_monitor: TrafficMonitor | None = None):
         self.log_cb = log_cb
+        self.traffic_monitor = traffic_monitor
         self.lock = threading.Lock()
         self.blocked_domains: set[str] = set()
         self.allowed_domains: set[str] = set()
@@ -369,7 +519,6 @@ class AdBlockEngine:
                     mod_lower = modifiers.lower()
                     if "badfilter" in mod_lower or "ctag=" in mod_lower or "client=" in mod_lower:
                         continue
-                    # Skip non-blocking rewrite rules (unless rewriting to 0.0.0.0 / 127.0.0.1 / NXDOMAIN)
                     if "dnsrewrite=" in mod_lower:
                         if not any(x in mod_lower for x in ("0.0.0.0", "127.0.0.1", "nxdomain", "refused", "noerror")):
                             continue
@@ -377,22 +526,21 @@ class AdBlockEngine:
                 if rule.startswith("||"):
                     rule = rule[2:]
                 elif rule.startswith("|"):
-                    continue  # Skip URL-prefix rules like |http://...
+                    continue
 
                 if "^" in rule:
                     rule, _, rest = rule.partition("^")
                     if rest and rest != "/":
-                        continue  # URL path after ^, not a pure domain rule
+                        continue
                 rule = rule.rstrip("/")
                 if "/" in rule:
-                    continue  # URL path rule (e.g. ||site.com/ads.js), do not block whole domain
+                    continue
 
                 d = cls._clean_valid_domain(rule)
                 if d:
                     blocked.add(d)
                 continue
 
-            # Strip inline comments for hosts / plain domain lines
             if "#" in line:
                 line = line.split("#", 1)[0].strip()
             if not line:
@@ -500,7 +648,6 @@ class AdBlockEngine:
             if parsed.query:
                 path += "?" + parsed.query
 
-            # Resolve filter host via SSH tunnel DNS first
             resolved_ip_bytes = dns_resolver_fn(host) if dns_resolver_fn else None
 
             raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -550,6 +697,8 @@ class AdBlockEngine:
                     "Connection: close\r\n\r\n"
                 ).encode("utf-8")
                 sock.sendall(http_req)
+                if self.traffic_monitor:
+                    self.traffic_monitor.add_tcp_tx(len(http_req))
 
                 http_resp = http.client.HTTPResponse(sock, method="GET")
                 http_resp.begin()
@@ -568,7 +717,9 @@ class AdBlockEngine:
                     http_resp.close()
                     raise RuntimeError(f"HTTP {status} {reason}")
 
-                body = http_resp.read(30 * 1024 * 1024)  # Up to 30 MB limit
+                body = http_resp.read(30 * 1024 * 1024)
+                if self.traffic_monitor and body:
+                    self.traffic_monitor.add_tcp_rx(len(body))
                 content_enc = (http_resp.getheader("Content-Encoding") or "").lower()
                 http_resp.close()
 
@@ -946,10 +1097,17 @@ class AskpassServer:
 # ----------------- badvpn-udpgw Client Bridge -----------------
 class BadVpnClient:
     """Manages TCP connection to badvpn-udpgw daemon."""
-    def __init__(self, udpgw_port: int, udp_sock: socket.socket, log_cb):
+    def __init__(
+        self,
+        udpgw_port: int,
+        udp_sock: socket.socket,
+        log_cb,
+        traffic_monitor: TrafficMonitor | None = None
+    ):
         self.udpgw_port = udpgw_port
         self.udp_sock = udp_sock
         self.log_cb = log_cb
+        self.traffic_monitor = traffic_monitor
         self.tcp_sock = None
         self.running = True
         self.lock = threading.Lock()
@@ -1001,6 +1159,8 @@ class BadVpnClient:
             with self.lock:
                 if self.tcp_sock:
                     self.tcp_sock.sendall(frame)
+                    if self.traffic_monitor:
+                        self.traffic_monitor.add_udp_tx(len(payload))
         except Exception:
             self._close_sock()
 
@@ -1030,6 +1190,9 @@ class BadVpnClient:
             src_ip_bytes = packet[3:7]       # Source IP (4 bytes)
             src_port_bytes = packet[7:9]     # Source Port (2 bytes)
             payload = packet[9:]             # Pure UDP payload
+
+            if self.traffic_monitor and payload:
+                self.traffic_monitor.add_udp_rx(len(payload))
 
             with self.lock:
                 info = self.conns_rev.get(conid)
@@ -1078,7 +1241,8 @@ class SocksUdpBridge:
         adblock_engine: AdBlockEngine,
         bypass_list: str,
         extra_bypass: list[str],
-        log_cb
+        log_cb,
+        traffic_monitor: TrafficMonitor | None = None
     ):
         self.socks_port = socks_port
         self.internal_ssh_port = internal_ssh_port
@@ -1090,6 +1254,7 @@ class SocksUdpBridge:
         self.bypass_list = bypass_list
         self.extra_bypass = extra_bypass or []
         self.log_cb = log_cb
+        self.traffic_monitor = traffic_monitor
         self.running = True
 
         # Thread-safe DNS cache & in-flight deduplication
@@ -1107,7 +1272,9 @@ class SocksUdpBridge:
         if self.enable_udp:
             self.udp_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_server.bind(('127.0.0.1', socks_port))
-            self.badvpn_client = BadVpnClient(udpgw_port, self.udp_server, log_cb)
+            self.badvpn_client = BadVpnClient(
+                udpgw_port, self.udp_server, log_cb, traffic_monitor=self.traffic_monitor
+            )
 
     def clear_dns_cache(self):
         with self.dns_lock:
@@ -1209,7 +1376,10 @@ class SocksUdpBridge:
 
             tx_id = os.urandom(2)
             dns_pkt = build_dns_query(domain, tx_id)
-            ssh_sock.sendall(struct.pack("!H", len(dns_pkt)) + dns_pkt)
+            framed_query = struct.pack("!H", len(dns_pkt)) + dns_pkt
+            ssh_sock.sendall(framed_query)
+            if self.traffic_monitor:
+                self.traffic_monitor.add_tcp_tx(len(framed_query))
 
             len_hdr = self._recv_exact(ssh_sock, 2)
             if not len_hdr:
@@ -1218,6 +1388,8 @@ class SocksUdpBridge:
             rdata = self._recv_exact(ssh_sock, rlen)
             if not rdata:
                 return None
+            if self.traffic_monitor:
+                self.traffic_monitor.add_tcp_rx(2 + len(rdata))
 
             ip_str = parse_dns_a_response(rdata, tx_id)
             if ip_str:
@@ -1298,21 +1470,21 @@ class SocksUdpBridge:
                 time.sleep(0.08)
         return None
 
-    def _bidirectional_pipe(self, sock1: socket.socket, sock2: socket.socket):
-        sock1.settimeout(None)
-        sock2.settimeout(None)
+    def _bidirectional_pipe(self, client_sock: socket.socket, ssh_sock: socket.socket):
+        client_sock.settimeout(None)
+        ssh_sock.settimeout(None)
         closed = threading.Event()
 
         def close_both():
             if not closed.is_set():
                 closed.set()
-                for s in (sock1, sock2):
+                for s in (client_sock, ssh_sock):
                     try:
                         s.close()
                     except Exception:
                         pass
 
-        def forward(src, dst):
+        def forward(src, dst, is_tx: bool):
             try:
                 while not closed.is_set() and self.running:
                     chunk = src.recv(65536)
@@ -1323,11 +1495,16 @@ class SocksUdpBridge:
                             pass
                         break
                     dst.sendall(chunk)
+                    if self.traffic_monitor:
+                        if is_tx:
+                            self.traffic_monitor.add_tcp_tx(len(chunk))
+                        else:
+                            self.traffic_monitor.add_tcp_rx(len(chunk))
             except Exception:
                 close_both()
 
-        t1 = threading.Thread(target=forward, args=(sock1, sock2), daemon=True)
-        t2 = threading.Thread(target=forward, args=(sock2, sock1), daemon=True)
+        t1 = threading.Thread(target=forward, args=(client_sock, ssh_sock, True), daemon=True)
+        t2 = threading.Thread(target=forward, args=(ssh_sock, client_sock, False), daemon=True)
         t1.start()
         t2.start()
 
@@ -1464,7 +1641,6 @@ class SocksUdpBridge:
 
                     domain = domain_bytes.decode("utf-8", errors="ignore")
                     if self.is_domain_blocked(domain):
-                        # Reply 0x02: Connection not allowed by ruleset
                         client_sock.sendall(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
                         client_sock.close()
                         return
@@ -1610,7 +1786,7 @@ class SSHTunnelApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SSH Tunnel")
-        self.geometry("560x840")
+        self.geometry("560x860")
         self.resizable(False, False)
         self.configure(bg="#1E1E24")
 
@@ -1623,7 +1799,14 @@ class SSHTunnelApp(tk.Tk):
         self._is_loading_adblock = False
         self._current_extra_bypass = []
 
-        self.adblock_engine = AdBlockEngine(log_cb=lambda msg: self.after(0, self.log, msg))
+        self.traffic_monitor = TrafficMonitor()
+        self._last_stats_snapshot = None
+        self._active_bottom_tab = "stats"
+
+        self.adblock_engine = AdBlockEngine(
+            log_cb=lambda msg: self.after(0, self.log, msg),
+            traffic_monitor=self.traffic_monitor
+        )
 
         # Profile & Bypass state
         self.profiles: dict[str, dict] = {}
@@ -1634,6 +1817,11 @@ class SSHTunnelApp(tk.Tk):
 
         self._build_ui()
         self.load_config(CONFIG_FILE)
+
+        # Start on the Statistics tab by default and launch the 1-second graph updater
+        self.select_bottom_tab("stats")
+        self._update_stats_loop()
+
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     @staticmethod
@@ -1655,10 +1843,10 @@ class SSHTunnelApp(tk.Tk):
 
     def _build_ui(self):
         # 1. Main toggle button & status area
-        btn_frame = tk.Frame(self, bg="#1E1E24", pady=6)
+        btn_frame = tk.Frame(self, bg="#1E1E24", pady=5)
         btn_frame.pack(fill="x")
 
-        self.canvas_size = 110
+        self.canvas_size = 108
         self.canvas = tk.Canvas(
             btn_frame,
             width=self.canvas_size,
@@ -1694,7 +1882,7 @@ class SSHTunnelApp(tk.Tk):
         # 2. Settings frame
         settings_frame = tk.LabelFrame(
             self, text=" Connection Settings ", bg="#1E1E24", fg="#E0E0E0",
-            font=("Segoe UI", 9, "bold"), padx=10, pady=5
+            font=("Segoe UI", 9, "bold"), padx=10, pady=4
         )
         settings_frame.pack(fill="x", padx=15, pady=2)
         settings_frame.grid_columnconfigure(1, weight=1)
@@ -1702,7 +1890,7 @@ class SSHTunnelApp(tk.Tk):
         # Row 0: Connection Profiles
         self._add_label(settings_frame, "Profile:", 0, 0)
         profile_bar = tk.Frame(settings_frame, bg="#1E1E24")
-        profile_bar.grid(row=0, column=1, columnspan=3, sticky="we", padx=3, pady=(2, 5))
+        profile_bar.grid(row=0, column=1, columnspan=3, sticky="we", padx=3, pady=(2, 4))
 
         self.profile_var = tk.StringVar(value="Default")
         self.profile_combo = ttk.Combobox(
@@ -1833,7 +2021,7 @@ class SSHTunnelApp(tk.Tk):
         # Row 8: Bypass List (opens in a separate window)
         self._add_label(settings_frame, "Bypass List:", 8, 0)
         bypass_frame = tk.Frame(settings_frame, bg="#1E1E24")
-        bypass_frame.grid(row=8, column=1, columnspan=3, sticky="we", padx=3, pady=3)
+        bypass_frame.grid(row=8, column=1, columnspan=3, sticky="we", padx=3, pady=2)
 
         self.bypass_btn = tk.Button(
             bypass_frame, text="Edit Bypass List... (0 rules)", command=self.open_bypass_window,
@@ -1844,7 +2032,7 @@ class SSHTunnelApp(tk.Tk):
 
         # Row 9: Action buttons
         io_btn_frame = tk.Frame(settings_frame, bg="#1E1E24")
-        io_btn_frame.grid(row=9, column=0, columnspan=4, pady=(6, 2), sticky="e")
+        io_btn_frame.grid(row=9, column=0, columnspan=4, pady=(5, 2), sticky="e")
 
         self.test_btn = tk.Button(
             io_btn_frame, text="⚡ Test", command=self.run_test,
@@ -1865,19 +2053,313 @@ class SSHTunnelApp(tk.Tk):
         )
         export_btn.pack(side="left", padx=4)
 
-        # 3. Log console
-        log_frame = tk.LabelFrame(
-            self, text=" SSH & Bridge Log ", bg="#1E1E24", fg="#E0E0E0",
-            font=("Segoe UI", 9, "bold"), padx=5, pady=5
+        # 3. Bottom Tabbed Area (Statistics & SSH/Bridge Log)
+        bottom_outer = tk.Frame(self, bg="#1E1E24")
+        bottom_outer.pack(fill="both", expand=True, padx=15, pady=(4, 8))
+
+        # Tab Header Bar
+        tab_bar = tk.Frame(bottom_outer, bg="#1E1E24")
+        tab_bar.pack(fill="x")
+
+        self.stats_tab_btn = tk.Button(
+            tab_bar,
+            text="📊 Traffic Statistics",
+            command=lambda: self.select_bottom_tab("stats"),
+            bg="#2563EB",
+            fg="#FFFFFF",
+            activebackground="#1D4ED8",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=4,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2"
         )
-        log_frame.pack(fill="both", expand=True, padx=15, pady=4)
+        self.stats_tab_btn.pack(side="left", padx=(0, 3))
+
+        self.log_tab_btn = tk.Button(
+            tab_bar,
+            text="📜 SSH & Bridge Log",
+            command=lambda: self.select_bottom_tab("log"),
+            bg="#2A2C35",
+            fg="#A0A5B5",
+            activebackground="#32353E",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=4,
+            font=("Segoe UI", 9, "bold"),
+            cursor="hand2"
+        )
+        self.log_tab_btn.pack(side="left", padx=3)
+
+        self.reset_stats_btn = tk.Button(
+            tab_bar,
+            text="Reset Stats",
+            command=self._reset_traffic_stats,
+            bg="#2A2C35",
+            fg="#A0A5B5",
+            activebackground="#32353E",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=8,
+            pady=3,
+            font=("Segoe UI", 8),
+            cursor="hand2"
+        )
+        self.reset_stats_btn.pack(side="right")
+
+        # Tab Content Container
+        self.tab_content = tk.Frame(
+            bottom_outer, bg="#16171C", highlightbackground="#2B2D35", highlightthickness=1
+        )
+        self.tab_content.pack(fill="both", expand=True)
+
+        # --- Tab 1: Traffic Statistics (Default on startup) ---
+        self.stats_panel = tk.Frame(self.tab_content, bg="#16171C", padx=8, pady=6)
+
+        # TCP Section Header
+        tcp_hdr = tk.Frame(self.stats_panel, bg="#16171C")
+        tcp_hdr.pack(fill="x", pady=(0, 2))
+
+        tk.Label(
+            tcp_hdr, text="● TCP", bg="#16171C", fg="#38BDF8", font=("Segoe UI", 9, "bold")
+        ).pack(side="left")
+
+        self.tcp_speed_lbl = tk.Label(
+            tcp_hdr,
+            text="0 B/s   (↓ 0 B/s   ↑ 0 B/s)",
+            bg="#16171C",
+            fg="#FFFFFF",
+            font=("Consolas", 9, "bold")
+        )
+        self.tcp_speed_lbl.pack(side="left", padx=(8, 0))
+
+        self.tcp_meta_lbl = tk.Label(
+            tcp_hdr,
+            text="Peak (5m): 0 B/s  |  Total: 0 B",
+            bg="#16171C",
+            fg="#8C93A4",
+            font=("Consolas", 8)
+        )
+        self.tcp_meta_lbl.pack(side="right")
+
+        # TCP Graph Canvas
+        self.tcp_graph_canvas = tk.Canvas(
+            self.stats_panel,
+            bg="#101115",
+            height=120,
+            highlightbackground="#252830",
+            highlightthickness=1
+        )
+        self.tcp_graph_canvas.pack(fill="both", expand=True, pady=(0, 6))
+        self.tcp_graph_canvas.bind("<Configure>", lambda e: self._redraw_graphs())
+
+        # UDP Section Header
+        udp_hdr = tk.Frame(self.stats_panel, bg="#16171C")
+        udp_hdr.pack(fill="x", pady=(2, 2))
+
+        tk.Label(
+            udp_hdr, text="● UDP", bg="#16171C", fg="#F59E0B", font=("Segoe UI", 9, "bold")
+        ).pack(side="left")
+
+        self.udp_speed_lbl = tk.Label(
+            udp_hdr,
+            text="0 B/s   (↓ 0 B/s   ↑ 0 B/s)",
+            bg="#16171C",
+            fg="#FFFFFF",
+            font=("Consolas", 9, "bold")
+        )
+        self.udp_speed_lbl.pack(side="left", padx=(8, 0))
+
+        self.udp_meta_lbl = tk.Label(
+            udp_hdr,
+            text="Peak (5m): 0 B/s  |  Total: 0 B",
+            bg="#16171C",
+            fg="#8C93A4",
+            font=("Consolas", 8)
+        )
+        self.udp_meta_lbl.pack(side="right")
+
+        # UDP Graph Canvas
+        self.udp_graph_canvas = tk.Canvas(
+            self.stats_panel,
+            bg="#101115",
+            height=120,
+            highlightbackground="#252830",
+            highlightthickness=1
+        )
+        self.udp_graph_canvas.pack(fill="both", expand=True, pady=(0, 2))
+        self.udp_graph_canvas.bind("<Configure>", lambda e: self._redraw_graphs())
+
+        # --- Tab 2: SSH & Bridge Log ---
+        self.log_panel = tk.Frame(self.tab_content, bg="#121316", padx=4, pady=4)
 
         self.log_area = scrolledtext.ScrolledText(
-            log_frame, bg="#121316", fg="#00FF66", insertbackground="white",
-            font=("Consolas", 8), state="disabled", wrap="word"
+            self.log_panel, bg="#121316", fg="#00FF66", insertbackground="white",
+            font=("Consolas", 8), state="disabled", wrap="word", relief="flat"
         )
         self.log_area.pack(fill="both", expand=True)
         self._attach_log_context_menu(self.log_area)
+
+    # ----------------- Bottom Tab Switcher & Traffic Graph Drawing -----------------
+    def select_bottom_tab(self, tab_name: str):
+        self._active_bottom_tab = tab_name
+        if tab_name == "stats":
+            self.log_panel.pack_forget()
+            self.stats_panel.pack(fill="both", expand=True)
+            self.stats_tab_btn.config(bg="#2563EB", fg="#FFFFFF")
+            self.log_tab_btn.config(bg="#2A2C35", fg="#A0A5B5")
+            self.reset_stats_btn.pack(side="right")
+            self._redraw_graphs()
+        else:
+            self.stats_panel.pack_forget()
+            self.log_panel.pack(fill="both", expand=True)
+            self.log_tab_btn.config(bg="#2563EB", fg="#FFFFFF")
+            self.stats_tab_btn.config(bg="#2A2C35", fg="#A0A5B5")
+            self.reset_stats_btn.pack_forget()
+
+    def _reset_traffic_stats(self):
+        self.traffic_monitor.reset()
+        self._last_stats_snapshot = self.traffic_monitor.sample_tick()
+        self._update_stats_labels(self._last_stats_snapshot)
+        self._redraw_graphs()
+
+    def _update_stats_loop(self):
+        try:
+            snap = self.traffic_monitor.sample_tick()
+            self._last_stats_snapshot = snap
+            self._update_stats_labels(snap)
+            if self._active_bottom_tab == "stats":
+                self._redraw_graphs()
+        except Exception:
+            pass
+        finally:
+            self.after(1000, self._update_stats_loop)
+
+    def _update_stats_labels(self, snap: dict):
+        self.tcp_speed_lbl.config(
+            text=(
+                f"{format_speed(snap['tcp_bps'])}   "
+                f"(↓ {format_speed(snap['tcp_rx_bps'])}   ↑ {format_speed(snap['tcp_tx_bps'])})"
+            )
+        )
+        self.tcp_meta_lbl.config(
+            text=f"Peak (5m): {format_speed(snap['tcp_peak_5m'])}  |  Total: {format_bytes(snap['tcp_total'])}"
+        )
+
+        self.udp_speed_lbl.config(
+            text=(
+                f"{format_speed(snap['udp_bps'])}   "
+                f"(↓ {format_speed(snap['udp_rx_bps'])}   ↑ {format_speed(snap['udp_tx_bps'])})"
+            )
+        )
+        self.udp_meta_lbl.config(
+            text=f"Peak (5m): {format_speed(snap['udp_peak_5m'])}  |  Total: {format_bytes(snap['udp_total'])}"
+        )
+
+    def _redraw_graphs(self):
+        snap = self._last_stats_snapshot
+        if not snap:
+            return
+        self._draw_single_graph(
+            canvas=self.tcp_graph_canvas,
+            history=snap["tcp_history"],
+            line_color="#38BDF8",
+            fill_color="#112A3E",
+            label_prefix="TCP"
+        )
+        self._draw_single_graph(
+            canvas=self.udp_graph_canvas,
+            history=snap["udp_history"],
+            line_color="#F59E0B",
+            fill_color="#33240F",
+            label_prefix="UDP"
+        )
+
+    def _draw_single_graph(
+        self,
+        canvas: tk.Canvas,
+        history: list[float],
+        line_color: str,
+        fill_color: str,
+        label_prefix: str
+    ):
+        canvas.delete("all")
+        w = canvas.winfo_width()
+        h = canvas.winfo_height()
+        if w < 40 or h < 30:
+            return
+
+        pad_left = 6
+        pad_right = 6
+        pad_top = 16
+        pad_bottom = 16
+
+        plot_w = max(10, w - pad_left - pad_right)
+        plot_h = max(10, h - pad_top - pad_bottom)
+        x0 = pad_left
+        y0 = pad_top
+        x1 = x0 + plot_w
+        y1 = y0 + plot_h
+
+        peak_val = max(history) if history else 0.0
+        scale_max = nice_scale_ceiling(peak_val)
+
+        # Horizontal grid lines (100%, 50%, 0%)
+        canvas.create_line(x0, y0, x1, y0, fill="#22252E", dash=(2, 3))
+        y_mid = y0 + plot_h * 0.5
+        canvas.create_line(x0, y_mid, x1, y_mid, fill="#22252E", dash=(2, 3))
+        canvas.create_line(x0, y1, x1, y1, fill="#2A2E39")
+
+        # Vertical minute grid lines (-5m, -4m, -3m, -2m, -1m, now)
+        num_points = len(history)
+        for minute_idx in range(6):
+            frac = minute_idx / 5.0
+            vx = x0 + frac * plot_w
+            if 0 < minute_idx < 5:
+                canvas.create_line(vx, y0, vx, y1, fill="#1B1E26", dash=(2, 4))
+            lbl_text = "now" if minute_idx == 5 else f"-{5 - minute_idx}m"
+            anchor = "e" if minute_idx == 5 else ("w" if minute_idx == 0 else "center")
+            canvas.create_text(
+                vx, h - 3, text=lbl_text, fill="#687082", font=("Consolas", 7), anchor=anchor
+            )
+
+        # Plot area & schematic curve
+        if num_points >= 2:
+            step_x = plot_w / float(num_points - 1)
+            coords = []
+            for idx, val in enumerate(history):
+                px = x0 + idx * step_x
+                clamped = min(max(val, 0.0), scale_max)
+                py = y1 - (clamped / scale_max) * plot_h
+                coords.extend((px, py))
+
+            # Filled polygon under curve
+            poly_coords = [x0, y1] + coords + [x1, y1]
+            canvas.create_polygon(poly_coords, fill=fill_color, outline="")
+
+            # Top polyline
+            canvas.create_line(coords, fill=line_color, width=1.5, smooth=False)
+
+        # Scale labels overlay
+        canvas.create_text(
+            x0 + 3, y0 - 2,
+            text=f"Scale: {format_speed(scale_max)}",
+            fill="#8C93A4",
+            font=("Consolas", 8),
+            anchor="sw"
+        )
+        canvas.create_text(
+            x1 - 3, y0 - 2,
+            text=f"50%: {format_speed(scale_max * 0.5)}",
+            fill="#687082",
+            font=("Consolas", 7),
+            anchor="se"
+        )
 
     def _add_label(self, parent, text, r, c):
         lbl = tk.Label(parent, text=text, bg="#1E1E24", fg="#A0A5B5", font=("Segoe UI", 8))
@@ -2817,7 +3299,8 @@ class SSHTunnelApp(tk.Tk):
                 adblock_engine=self.adblock_engine,
                 bypass_list=bypass,
                 extra_bypass=self._current_extra_bypass,
-                log_cb=lambda msg: self.after(0, self.log, msg)
+                log_cb=lambda msg: self.after(0, self.log, msg),
+                traffic_monitor=self.traffic_monitor
             )
             self.bridge.start()
         except Exception as e:
@@ -3002,3 +3485,4 @@ if __name__ == "__main__":
 
     app = SSHTunnelApp()
     app.mainloop()
+    
